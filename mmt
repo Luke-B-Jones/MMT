@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# MMT - MF4 Methylation Toolkit: methylation analyses on top of a MATAFILER4 + GeneCat run.
+#   mmt <command> [options]      mmt help <command>
+# Put it on your PATH with a symlink:  ln -s /path/to/MMT/mmt ~/bin/mmt
+set -Eeuo pipefail
+MMT_HOME=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+MMT_VERSION=$(< "$MMT_HOME/VERSION")
+export MMT_HOME
+# shellcheck source=lib/common.sh
+source "$MMT_HOME/lib/common.sh"
+
+main_help() {
+    cat << EOF
+MMT $MMT_VERSION - MF4 Methylation Toolkit
+Methylation (PacBio HiFi kinetics: m6A, m4C) on top of a MATAFILER4 run and its GeneCat MGS stage.
+
+Usage: mmt <command> [options]
+
+Commands
+  MGScall   methylation of each MGS on its representative MAG, per sample
+              --mgs-rep  reads of every MAG of the MGS   |   --mag-rep  reads of the representative MAG only
+  check     show the settings in effect, check tools and inputs (with -o: build / refresh the index there)
+  version   print the version (and git commit)
+  help      this text, or 'mmt help <command>'
+
+Settings: config/mmt.conf (defaults) -> config/site.conf (your cluster) -> \$MMT_CONFIG -> --config FILE
+          -> command-line options. Results folder (-o) is reused by every run and every command.
+EOF
+}
+
+module_file() {   # module_file COMMAND -> modules/<file>.sh
+    case $1 in
+        MGScall|mgscall) echo "$MMT_HOME/modules/MGScall.sh" ;;
+        check)           echo "$MMT_HOME/modules/check.sh" ;;
+        *) return 1 ;;
+    esac
+}
+
+MMT_CMD=${1:-help}
+[[ $# -gt 0 ]] && shift
+case $MMT_CMD in
+    help|-h|--help)
+        if [[ -n ${1:-} ]]; then
+            f=$(module_file "$1") || usage_die "unknown command '$1'"
+            # shellcheck source=/dev/null
+            source "$f"; module_help
+        else
+            main_help
+        fi ;;
+    version|-v|--version)
+        echo "MMT $(mmt_version)" ;;
+    *)
+        f=$(module_file "$MMT_CMD") || { echo "mmt: unknown command '$MMT_CMD' (see: mmt help)" >&2; exit 2; }
+        MMT_CMD=$(basename "$f" .sh)
+        # shellcheck source=/dev/null
+        source "$f"
+        load_config "$@"
+        module_main "$@" ;;
+esac

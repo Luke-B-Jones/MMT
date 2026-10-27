@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""check_truth.py MOCKDIR OUT MODE... : compare MMT MGScall results on the mock run (mock_mf4.py) with the truth.
+Prints one line per check (PASS / FAIL) and exits 1 if any check failed. Needs duckdb on PATH or $DUCKDB_PY (python duckdb
+not required: reads parquet with pyarrow if present, else with the duckdb CLI given in $DUCKDB_BIN)."""
+import csv, glob, io, json, os, subprocess, sys
+
+mock, out, modes = sys.argv[1], sys.argv[2], sys.argv[3:]
+T = json.load(open(os.path.join(mock, "truth.json")))
+DUCK = os.environ.get("DUCKDB_BIN", "duckdb")
+fails = 0
+
+
+def check(ok, msg):
+    global fails
+    print(("PASS  " if ok else "FAIL  ") + msg)
+    fails += not ok
+
+
+def q(sql):   # duckdb CLI -> list of dict rows
+    r = subprocess.run([DUCK, "-csv", "-c", sql], capture_output=True, text=True, check=True).stdout
+    return list(csv.DictReader(io.StringIO(r)))
+
+
+COMP = str.maketrans("ACGT", "TGCA")
+def motif_sites(seqs, names, motif):   # (contig, pos 1-based, strand) of the A at motif position 2, both strands
+    s = set()
+    rcm = motif.translate(COMP)[::-1]
+    for name, seq in zip(names, seqs):
+        i = seq.find(motif)
+        while i >= 0:
+            s.add((name, i + 2, "+")); i = seq.find(motif, i + 1)
+        i = seq.find(rcm)
+        while i >= 0:
+            s.add((name, i + len(motif) - 1, "-")); i = seq.find(rcm, i + 1)
+    return s
+
+
+SPECIES = {"MGS.0": {"A", "A2", "A3"}, "MGS.1": {"B"}}
+REP = {"MGS.0": (T["seq"]["A"], ["S1__C1", "S1__C2"], "GAAG"),
+       "MGS.1": (T["seq"]["B"], ["S2.run2M2__C3", "S2.run2M2__C4"], "GATC")}
+EXPECT = {"mag-rep": {("MGS.0", "S1"), ("MGS.1", "S2"), ("MGS.1", "S2.run2")},
+          "mgs-rep": {("MGS.0", s) for s in ("S1", "S2", "S2.run2", "S3")} | {("MGS.1", s) for s in ("S1", "S2", "S2.run2")}}
+
+# ---- read -> MAG index
+for f in sorted(glob.glob(os.path.join(out, "index", "reads", "sample=*", "data.parquet"))):
+    s = f.split("sample=")[1].split("/")[0]
+    rows = q(f"SELECT read, MGS, MAG, is_rep, dup FROM read_parquet('{f}')")
+    wrong = [r for r in rows if T["reads"].get(r["read"]) not in SPECIES.get(r["MGS"], ())]
+    flagged = [r for r in rows if T["flag"].get(r["read"], 0) & 0x600]
+    check(not wrong and not flagged and rows, f"reads {s}: {len(rows)} assigned, {len(wrong)} to a wrong species, "
+          f"{len(flagged)} QC-fail/duplicate used")
+    for m, sp in SPECIES.items():   # every unflagged, primary-mapped truth read of the species is found
+        want = {r for r, n in T["reads"].items() if r.startswith(f"m84_{s}/") and n in sp
+                and r in T["flag"] and not T["flag"][r] & 0x600}
+        got = {r["read"] for r in rows if r["MGS"] == m}
+        if want:
+            check(len(got & want) >= 0.97 * len(want), f"reads {s} {m}: {len(got & want)}/{len(want)} truth reads assigned")
+
+for mode in modes:
+    D = os.path.join(out, "MGScall", mode)
+    parts = {(p.split("MGS=")[1].split("/")[0], p.split("sample=")[1].split("/")[0])
+             for p in glob.glob(os.path.join(D, "MGS=*", "sample=*", "data.parquet"))}
+    check(parts == EXPECT[mode], f"{mode}: results for {sorted(parts)}")
+    cols = q(f"DESCRIBE SELECT * FROM read_parquet('{D}/*/*/*.parquet', hive_partitioning=true)")
+    want_cols = ["contig", "pos", "strand", "base", "coverage", "score", "ipdRatio", "tMean", "tErr", "modelPrediction",
+                 "frac", "fracLow", "fracUp", "call", "identificationQv", "pile_depth", "n_ref", "top_alt", "n_alt",
+                 "ctx_alt_pct", "ctx_alt_n", "clip_ctx_n", "MGS", "sample"]
+    check([c["column_name"] for c in cols] == want_cols, f"{mode}: columns {[c['column_name'] for c in cols]}")
+    bad = q(f"""SELECT count(*) n FROM read_parquet('{D}/*/*/*.parquet', hive_partitioning=true)
+               WHERE base NOT IN ('A','C') OR coverage < 3 OR strand NOT IN ('+','-') OR pile_depth < coverage""")[0]["n"]
+    check(bad == "0", f"{mode}: rows with a non-A/C base, coverage < 3, bad strand or pile_depth < coverage: {bad}")
+    # state files agree with the results
+    for s in sorted({s for _, s in EXPECT[mode]}):
+        st = list(csv.DictReader(open(os.path.join(D, "_state", f"{s}.tsv")), delimiter="\t"))
+        done = {(r["MGS"], s) for r in st if r["status"] == "done"}
+        check(done == {p for p in parts if p[1] == s}, f"{mode} {s}: state done = {sorted(m for m, _ in done)}")
+    # methylation at the motif = truth. ipdSummary gives frac only where it identified m6A, so the fraction is also
+    # read from the mean ipdRatio: ipdRatio - 1 grows linearly with the methylated fraction (scaled to a 0.9 sample)
+    stat = {}
+    for m, s in sorted(parts):
+        seq, names, motif = REP[m]
+        sites = motif_sites(seq, names, motif)
+        rows = q(f"""SELECT contig, pos, strand, frac, call, ipdRatio FROM read_parquet('{D}/MGS={m}/sample={s}/data.parquet')
+                    WHERE base = 'A' AND coverage >= 11 AND ctx_alt_pct = 0""")
+        on = [r for r in rows if (r["contig"], int(r["pos"]), r["strand"]) in sites]
+        off = [r for r in rows if (r["contig"], int(r["pos"]), r["strand"]) not in sites]
+        fr = 0.9 if m == "MGS.1" else T["FR"][s]
+        fs = [float(r["frac"]) for r in on if r["frac"]]
+        stat[(m, s)] = dict(n=len(on), fr=fr, ipd=sum(float(r["ipdRatio"]) for r in on) / max(1, len(on)),
+                            frac=sum(fs) / max(1, len(fs)), det=sum(r["call"] != "none" for r in on) / max(1, len(on)),
+                            false=sum(r["call"] == "m6A" for r in off) / max(1, len(off)), noff=len(off))
+    for (m, s), v in sorted(stat.items()):
+        ref = [w["ipd"] for (mm, _), w in stat.items() if mm == m and w["fr"] == 0.9]
+        est = 0.9 * (v["ipd"] - 1) / (sum(ref) / len(ref) - 1)
+        ok = v["n"] > 50 and abs(est - v["fr"]) < 0.1 and v["false"] < 0.01 and v["det"] > (0.85 if v["fr"] == 0.9 else 0.6)
+        ok = ok and (v["fr"] != 0.9 or v["frac"] > 0.85)
+        check(ok, f"{mode} {m} {s}: {v['n']} motif A, fraction from ipdRatio {est:.2f} (truth {v['fr']}), with a call "
+                  f"{v['det']:.2f}, mean frac where given {v['frac']:.2f}, m6A at {v['false']:.4f} of {v['noff']} other A")
+
+# ---- strain differences: S3's reads (strain A2) on the MGS.0 representative
+if "mgs-rep" in modes:
+    A, A2 = T["seq"]["A"], T["seq"]["A2"]
+    ia, il = T["island"]
+    snp = {("S1__C1", i + 1) for i in range(len(A[0])) if A2[0][i if i < ia else i + il] != A[0][i]}
+    snp |= {("S1__C2", i + 1) for i in range(len(A[1])) if A2[1][i] != A[1][i]}
+    f = os.path.join(out, "MGScall", "mgs-rep", "MGS=MGS.0", "sample=S3", "data.parquet")
+    rows = q(f"SELECT contig, pos, strand, pile_depth, n_ref, ctx_alt_pct, clip_ctx_n FROM read_parquet('{f}') WHERE coverage >= 5")
+    at = [r for r in rows if (r["contig"], int(r["pos"])) in snp]
+    flagged = sum(int(r["n_ref"]) <= 0.2 * int(r["pile_depth"]) for r in at) / max(1, len(at))
+    near = {(c, p + d) for c, p in snp for d in range(-10, 11)}
+    far = [r for r in rows if (r["contig"], int(r["pos"])) not in near and abs(int(r["pos"]) - ia) > 20]
+    clean = sum(r["ctx_alt_pct"] == "0" for r in far) / max(1, len(far))
+    ctx = sum(int(r["ctx_alt_pct"]) >= 50 for r in rows if (r["contig"], int(r["pos"])) in near) / \
+        max(1, sum(1 for r in rows if (r["contig"], int(r["pos"])) in near))
+    junction = [r for r in rows if r["contig"] == "S1__C1" and abs(int(r["pos"]) - ia) <= 5]
+    check(len(at) > 100 and flagged > 0.95, f"S3 strain SNPs: {len(at)} rows at SNPs, {flagged:.3f} show the other base")
+    check(ctx > 0.95 and clean > 0.99, f"S3 context flag: {ctx:.3f} of rows within 10 bp of a SNP flagged, "
+          f"{clean:.4f} of {len(far)} rows far from SNPs clean")
+    check(any(int(r["clip_ctx_n"]) > 0 for r in junction), f"S3 island junction: reads clipped at representative position ~{ia}")
+    # --mgs-rep S1 also has the A3 strain's reads (own bin) ; --mag-rep does not
+    if "mag-rep" in modes:
+        mol = {}
+        for mode in ("mgs-rep", "mag-rep"):
+            for r in csv.DictReader(open(os.path.join(out, "MGScall", mode, "_state", "S1.tsv")), delimiter="\t"):
+                if r["MGS"] == "MGS.0":
+                    mol[mode] = int(r["molecules"])
+        nA3 = sum(1 for r, n in T["reads"].items() if r.startswith("m84_S1/") and n == "A3")
+        check(mol["mgs-rep"] > mol["mag-rep"], f"S1 MGS.0 molecules: mgs-rep {mol['mgs-rep']} > mag-rep {mol['mag-rep']} "
+              f"(A3 strain reads: {nA3})")
+print(f"{'ALL PASS' if not fails else f'{fails} FAILED'}")
+sys.exit(1 if fails else 0)
