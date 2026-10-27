@@ -19,6 +19,8 @@ Usage: mmt <command> [options]
 Commands
   MGScall   methylation of each MGS on its representative MAG, per sample
               --mgs-rep  reads of every MAG of the MGS   |   --mag-rep  reads of the representative MAG only
+  dereplicate-contigs   each MGS as a short list of collinear blocks ("dereplicated contigs") with every
+              occurrence in every MAG, representative sequences and block order along the contigs
   check     show the settings in effect, check tools and inputs (with -o: build / refresh the index there)
   version   print the version (and git commit)
   help      this text, or 'mmt help <command>'
@@ -31,6 +33,7 @@ EOF
 module_file() {   # module_file COMMAND -> modules/<file>.sh
     case $1 in
         MGScall|mgscall) echo "$MMT_HOME/modules/MGScall.sh" ;;
+        dereplicate-contigs|derep) echo "$MMT_HOME/modules/dereplicate-contigs.sh" ;;
         check)           echo "$MMT_HOME/modules/check.sh" ;;
         *) return 1 ;;
     esac

@@ -15,7 +15,11 @@ die() {
     if (( MMT_LOGGING )); then echo "ERROR: $* (log: $MMT_LOG)" >&4; fi
     exit 1
 }
-usage_die() { echo "mmt ${MMT_CMD:-}: $*  (see: mmt help ${MMT_CMD:-})" >&2; exit 2; }
+usage_die() {
+    echo "mmt ${MMT_CMD:-}: $*  (see: mmt help ${MMT_CMD:-})" >&2
+    if (( MMT_LOGGING )); then echo "mmt ${MMT_CMD:-}: $*  (see: mmt help ${MMT_CMD:-})" >&4; fi
+    exit 2
+}
 start_log() {
     MMT_LOG=$1
     mkdir -p "$(dirname "$MMT_LOG")"
@@ -153,7 +157,7 @@ read_ids() {   # read_ids "A,B,C" | FILE : one ID per line (a file: first word o
     if [[ -f $1 ]]; then
         awk '!/^[[:space:]]*(#|$)/ {print $1}' "$1"
     else
-        tr ',' '\n' <<< "$1" | awk 'NF {print $1}'
+        tr -s ', \t' '\n' <<< "$1" | awk 'NF {print $1}'
     fi
 }
 
@@ -167,16 +171,18 @@ lock_take() {   # lock_take DIR : 0 = we hold it, 1 = someone else does
         echo "$(hostname) $BASHPID ${SLURM_JOB_ID:-none}" > "$d/owner"
         return 0
     fi
+    # judging + replacing a stale lock: one process at a time (a takeover mutex left > 5 min = by a killed process)
+    mkdir "$d.takeover" 2> /dev/null || { [[ -n $(find "$d.takeover" -maxdepth 0 -mmin +5 2> /dev/null) ]] && rm -rf "$d.takeover"; return 1; }
     read -r host pid job < "$d/owner" 2> /dev/null || true
     if lock_stale "$d" "$host" "$pid" "$job"; then
         log "taking over stale lock $d (owner: ${host:-?} pid ${pid:-?} job ${job:-?})"
         rm -rf "$d"
         if mkdir "$d" 2> /dev/null; then
             echo "$(hostname) $BASHPID ${SLURM_JOB_ID:-none}" > "$d/owner"
-            return 0
+            rmdir "$d.takeover"; return 0
         fi
     fi
-    return 1
+    rmdir "$d.takeover" 2> /dev/null; return 1
 }
 lock_stale() {   # lock_stale DIR HOST PID JOB
     local d=$1 host=$2 pid=$3 job=$4
@@ -184,23 +190,25 @@ lock_stale() {   # lock_stale DIR HOST PID JOB
         [[ -n $(find "$d" -maxdepth 0 -mmin +1 2> /dev/null) ]]; return
     fi
     if [[ -n $job && $job != none ]] && command -v squeue > /dev/null; then
-        [[ -z $(squeue -h -j "$job" -o %i 2> /dev/null) ]]; return
+        local o
+        o=$(squeue -h -j "$job" -o %i 2>&1) && { [[ -z $o ]]; return; }   # squeue answered: stale when the job is not listed
+        [[ $o == *"Invalid job id"* ]]; return                             # any other error (controller busy) = not stale
     fi
     [[ $host == "$(hostname)" ]] && ! kill -0 "$pid" 2> /dev/null
 }
 lock_release() { rm -rf -- "$1"; }
 
 # ============================================================================ MF4 index (shared by all modules)
-INDEX_METHOD=1   # bump when lib/mf4.py index output changes -> every OUT rebuilds its index on the next run
-INDEX_FILES="samples.tsv mgs.tsv mags.tsv units.tsv assemblies.tsv contigs.tsv.gz rep_contigs.tsv.gz report.txt"
+INDEX_METHOD=2   # bump when lib/mf4.py index output changes -> every OUT rebuilds its index on the next run
+INDEX_FILES="samples.tsv mgs.tsv mags.tsv units.tsv assemblies.tsv contigs.tsv.gz rep_contigs.tsv.gz inputs.tsv report.txt"
 resolve_inputs() {   # absolute MMT_MAP, MMT_MF4_RUN (from the map when not given), MMT_GENECAT, MVG (MAGvsGC)
     local out rid
     [[ -n ${MMT_MAP:-} ]] || usage_die "no MATAFILER4 map: --map FILE or MMT_MAP in config/site.conf"
     [[ -f $MMT_MAP ]] || die "map not found: $MMT_MAP"
     MMT_MAP=$(abspath "$MMT_MAP")
     if [[ -z ${MMT_MF4_RUN:-} ]]; then
-        out=$(awk '$1 == "#OutPath" {print $2; exit}' "$MMT_MAP")
-        rid=$(awk '$1 == "#RunID" {print $2; exit}' "$MMT_MAP")
+        out=$(awk '{sub(/\r$/, "")} $1 == "#OutPath" {print $2; exit}' "$MMT_MAP")
+        rid=$(awk '{sub(/\r$/, "")} $1 == "#RunID" {print $2; exit}' "$MMT_MAP")
         [[ -n $out && -n $rid ]] || usage_die "no MATAFILER4 run folder: -i DIR (the map has no #OutPath + #RunID)"
         MMT_MF4_RUN="${out%/}/$rid"
     fi
@@ -225,6 +233,8 @@ index_current() {   # the index in IDX was built from these inputs and is comple
     local f
     [[ $(cat "$IDX/index.fp" 2> /dev/null) == "$INDEX_FP" ]] || return 1
     for f in $INDEX_FILES; do [[ -s $IDX/$f ]] || return 1; done
+    # the assembly.txt and bin files it read are unchanged (re-binning changes MAG contigs without the map / MAGvsGC)
+    cmp -s <(cut -f2 "$IDX/inputs.tsv") <(cut -f1 "$IDX/inputs.tsv" | while read -r f; do stamp "$f"; done)
 }
 ensure_index() {
     local w=0
@@ -254,4 +264,5 @@ ensure_index() {
     rm -rf "$IDX/.build"
     lock_release "$IDX/.lock"
     log "index: $(grep -c . "$IDX/samples.tsv") samples (header incl.), $(grep -c . "$IDX/mgs.tsv") MGS (header incl.) - $IDX/report.txt"
+    grep -qE '^member MAGs: ok [0-9]+$' "$IDX/report.txt" || say "WARNING: index: $(grep -m1 '^member MAGs:' "$IDX/report.txt") - see $IDX/report.txt"
 }

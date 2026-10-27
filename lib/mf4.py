@@ -11,7 +11,7 @@ readMapS), so MMT finds exactly the contigs GeneCat used:
   co-assembly alias    "<SmplID>M<n>" = the n-th sample of an AssmblGrps group in map order -> SmplID
   bins of a sample     <assembly dir>/Binning/<binner>/<SmplID>   (lines: contig TAB bin)
   assembly dir         first line of <MF4 run>/<SmplID>/assemblies/metag/assembly.txt (shared by a co-assembly group)
-  representative       starred MAG of the MGS, else the first non-canopy MAG of its block (MAGvsGC row order)
+  representative       starred MAG of the MGS, else its first non-canopy MAG (MAGvsGC row order; rows need not be grouped)
   its FASTA            <GeneCat>/Bin_<binner>/Genomes/MGS_ctg/<MGS>.ctgs.<MAG>, ".gz" stripped, ".fna" added unless
                        it ends in .fa/.fna/.fasta, then ".gz"
 Every representative's contigs from the bin file must equal GeneCat's FASTA, else the index stops (the rules would be
@@ -102,7 +102,7 @@ def fasta_lengths(path):
 
 def index(a):
     os.makedirs(a.out, exist_ok=True)
-    rep_lines, fatal = [], []
+    rep_lines, fatal, seen = [], [], []     # seen: files read whose change rebuilds the index (assembly.txt, bin files)
     report = lambda s: rep_lines.append(s)
 
     # ---- samples
@@ -112,6 +112,7 @@ def index(a):
         sd = os.path.join(a.mf4_run, s)
         cram = os.path.join(sd, "mapping", f"{s}-smd.cram")
         at = os.path.join(sd, "assemblies", "metag", "assembly.txt")
+        seen.append(at)
         asm = os.path.normpath(first_line(at)) if os.path.isfile(at) and first_line(at) else ""
         why = [problem] if problem else []
         if not os.path.isfile(cram):
@@ -137,17 +138,12 @@ def index(a):
         ir = hd.index("Representative4MGS")
         ic = hd.index("Completeness") if "Completeness" in hd else None
         ix = hd.index("Contamination") if "Contamination" in hd else None
-        last = None
         for line in fh:
             f = line.rstrip("\n").split("\t")
             if len(f) < 2:
                 continue
             mag, mgs = f[0], f[1]
             canopy = mag.startswith("Cano__")
-            if mgs != last:
-                last = mgs
-                if not canopy:
-                    rep[mgs] = mag
             if not canopy and ((ir < len(f) and f[ir] == "*") or mgs not in rep):
                 rep[mgs] = mag
             if mgs in ("", "?") or canopy:
@@ -176,6 +172,7 @@ def index(a):
             binfile = os.path.join(info["asm"], "Binning", a.binner, s)
             by_binfile[binfile].setdefault(m.group(2), []).append(mag)
     for binfile, bins in by_binfile.items():
+        seen.append(binfile)
         if not os.path.isfile(binfile):
             for mags in bins.values():
                 for mag in mags:
@@ -287,6 +284,10 @@ def index(a):
         o.write("MGS\tcontig\tlength\n")
         for r in rep_ctg_rows:
             o.write("\t".join(map(str, r)) + "\n")
+    with open(os.path.join(a.out, "inputs.tsv"), "w") as o:      # same size:mtime format as common.sh stamp()
+        for f in sorted(set(seen)):
+            st = os.stat(f) if os.path.exists(f) else None
+            o.write(f"{f}\t{f'{st.st_size}:{int(st.st_mtime)}' if st else 'missing'}\n")
     with open(os.path.join(a.out, "report.txt"), "w") as o:
         o.write("\n".join(rep_lines + [f"FATAL: {x}" for x in fatal]) + "\n")
     print("\n".join(rep_lines))
