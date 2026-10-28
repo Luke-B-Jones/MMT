@@ -21,48 +21,60 @@ from the read kinetics. Result: one table per MGS x sample, every A and C of the
    assembly (`assemblies/metag/assembly.txt`) -> contigs (`Binning/<binner>/<SmplID>`). The representative's
    sequence is GeneCat's own `Genomes/MGS_ctg/<MGS>.ctgs.<MAG>[.fna].gz`; its contigs must equal the bin-file contigs,
    otherwise MMT stops (its naming rules would not match this GeneCat version).
-2. **Read -> MAG** (`OUT/index/reads/sample=<S>/`, shared by both modes). Each primary alignment in MATAFILER4's
-   `<S>/mapping/<S>-smd.cram` (minimap2 map-hifi to the sample's own assembly) whose contig belongs to an MGS MAG.
-   Alignments MATAFILER4 flagged as failed (0x200: > 5 % edits, < 50 % of the read aligned or MAPQ < 30) are never
-   used; duplicates (0x400) only with `MGSCALL_KEEP_DUP=1`. No new competitive mapping: MATAFILER4 already decided.
-3. **Kinetics reads.** The selected reads are taken from the sample's raw kinetics BAM (map `#DirPath` +
+2. **Read -> MAG** (`OUT/index/reads/<S>.parquet`, shared by both modes and by `ctg-meth`). Each primary alignment
+   in MATAFILER4's `<S>/mapping/<S>-smd.cram` (minimap2 map-hifi to the sample's own assembly) whose contig belongs
+   to an MGS MAG. Alignments MATAFILER4 flagged as failed (0x200: > 5 % edits, < 50 % of the read aligned or
+   MAPQ < 30) are never used; duplicates (0x400) are kept in the index with `dup = true` and used only with
+   `MGSCALL_KEEP_DUP=1`. No new competitive mapping: MATAFILER4 already decided.
+3. **Presence.** A sample is planned for an MGS only when its assembly has a MAG of the MGS (`--mag-rep`: the
+   representative). Before anything is read from its raw BAM, the molecules of step 2 are counted per MGS: fewer
+   than `MGSCALL_PRESENT_MOL` (default 10) = `absent` - recorded in `_state`, not processed. A sample whose selected
+   MGS are all absent is finished without reading its raw BAM.
+4. **Kinetics reads.** The selected reads are taken from the sample's raw kinetics BAM (map `#DirPath` +
    `SmplPrefix`.bam; one pass), split into one pseudo-read per strand (`ccs-kinetics-bystrandify`) and grouped by MGS.
-4. **Alignment** of each MGS's reads to its own representative only (`pbmm2 --preset CCS -y MGSCALL_MIN_IDENTITY`).
+5. **Alignment** of each MGS's reads to its own representative only (`pbmm2 --preset CCS -y MGSCALL_MIN_IDENTITY`).
    Kept: primary, MAPQ >= `MGSCALL_MIN_MAPQ` (drops repeats within the representative), no hard clip, aligned part
    >= `MGSCALL_MIN_PCT_ALIGNED` % of the read and >= `MGSCALL_MIN_ALN_BP` bp. Reads of a strain that differs from
    the representative are kept as long as they align at that identity; the sequence-agreement columns show where
    they differ.
-5. **Kinetics** - one ipdSummary run per sample on all its MGS (`--identify m6A,m4C --methylFraction
+6. **Kinetics** - one ipdSummary run per sample on all its MGS (`--identify m6A,m4C --methylFraction
    --mapQvThreshold MGSCALL_MIN_MAPQ --minCoverage 1 --maxCoverage 100000`) and, from the same aligned reads,
    `samtools mpileup` for the sequence-agreement columns.
-6. **Tables.** Rows for A and C (on the row's strand) with kinetic coverage >= `MGSCALL_MIN_ROW_COV`, written per MGS.
+7. **Tables.** Rows for A and C (on the row's strand) with kinetic coverage >= `MGSCALL_MIN_ROW_COV`, written per MGS.
 
 ## Output
 
 ```
-OUT/MGScall/<mode>/MGS=<MGS>/sample=<S>/data.parquet   one table per MGS x sample
-OUT/MGScall/<mode>/_state/<S>.tsv                      every MGS of the sample: status, read counts, fingerprint
-OUT/MGScall/<mode>/_state/<S>.stats.tsv                read accounting of the sample's last run
+OUT/mmt.log                                the output folder's log: every run, its plan per MGS, one line per sample
+                                           with each MGS's outcome (done / absent / ...), failures with their reason
+OUT/MGScall/<mode>/<MGS>/<S>.parquet       one table per MGS x sample (zstd), sorted by contig, pos, strand
+OUT/MGScall/<mode>/_state/<S>.tsv          every MGS of the sample: status, read counts, fingerprint
+OUT/MGScall/<mode>/_state/<S>.stats.tsv    read accounting of the sample's last run
+OUT/index/reads/<S>.parquet                read -> MAG of the sample (sample, read, MGS, MAG, is_rep, contig, pos, mapq, dup)
+OUT/index/depth/<S>.parquet                read depth of every MGS-MAG contig of the sample in 1 kb bins (sample, MGS,
+                                           MAG, contig, c_start, c_end, bp = reference bp of the primary + supplementary
+                                           alignments that are neither QC-fail nor duplicate; depth = bp / bin length)
 ```
 
-Read a whole mode (the folder names become the columns `MGS` and `sample`):
+Every file carries its own `MGS` and `sample` columns, so files can be read singly or all together:
 
 ```sql
 -- duckdb
 SELECT MGS, sample, count(*) FILTER (WHERE call = 'm6A') AS m6A_sites
-FROM read_parquet('OUT/MGScall/mgs-rep/*/*/*.parquet', hive_partitioning = true)
+FROM read_parquet('OUT/MGScall/mgs-rep/*/*.parquet')
 GROUP BY ALL;
 ```
 
 ```python
 import pandas as pd
-d = pd.read_parquet("OUT/MGScall/mgs-rep", filters=[("MGS", "=", "MGS.12")])   # pyarrow reads the partitions
+d = pd.read_parquet("OUT/MGScall/mgs-rep/MGS.12")            # every sample of one MGS
 ```
 
-### Columns of `data.parquet`
+### Columns of `<S>.parquet`
 
 | Column | Meaning |
 |---|---|
+| `MGS`, `sample` | the MGS and the sample (same in every row of a file) |
 | `contig` | representative contig (original MATAFILER4 name) |
 | `pos` | 1-based position |
 | `strand` | `+` / `-` (strand of the base whose kinetics are reported) |
@@ -90,7 +102,7 @@ compared with other samples there; `n_ref / pile_depth` and `ctx_alt_pct` show w
 | status | meaning |
 |---|---|
 | `done` | table written |
-| `no_reads` | no read of this sample lies on the MGS's MAG(s) (after the 0x200 / 0x400 filters) |
+| `absent` | fewer than `MGSCALL_PRESENT_MOL` molecules of this sample on the MGS's MAG(s) (after the 0x200 / 0x400 filters; mag-rep: on the representative) - not processed, no table (MMT <= 0.3: `no_reads`) |
 | `no_kinetics` | reads found, but no kinetics left after bystrandify |
 | `no_aligned` | no read passed the alignment filters on the representative |
 | `no_rows` | aligned, but no A/C with coverage >= `MGSCALL_MIN_ROW_COV` |
@@ -103,16 +115,27 @@ Every result carries a fingerprint of what it depends on: MMT method version, mo
 index (map + MAGvsGC), the sample's CRAM and raw BAM, and the representative's FASTA. A run computes only what is
 missing or whose fingerprint changed; everything else is kept. `--select` / `--samples` runs add to the same folders.
 A result is dropped when its MGS disappears from GeneCat or no longer has a MAG in the sample. `--force` redoes the
-selection. A failed sample does not stop the others; rerun the same command to resume.
+selection. A failed sample does not stop the others; rerun the same command to redo it (`grep FAIL OUT/mmt.log`
+says why it failed). `mmt status -o OUT` lists, per MGS, the samples done / absent / not yet.
+
+Results of MMT <= 0.2 (`MGS=<MGS>/sample=<S>/data.parquet`, read index `index/reads/sample=<S>/`) are moved into
+this layout by the first run of MMT 0.3 (tables rewritten with the `MGS` / `sample` columns, nothing recomputed;
+the read index is rebuilt once because it now also holds duplicates and read depth).
 
 ## HPC notes
 
 - The unit of work is a sample: its raw kinetics BAM is read once per run, whatever the number of MGS. Selecting
   more MGS per run costs little extra; one MGS per run over all samples costs a full pass over every raw BAM.
-- `--tmp "$TMPDIR"` (node-local) is fastest. A shared scratch folder instead keeps the reference indexes
-  (`<tmp>/mmt/refs/`) between jobs and lets a killed job resume its sample from the last finished step.
+- `--tmp "$TMPDIR"` (node-local) is fastest when it has room (ipdSummary's CSV takes ~80 bytes per base x strand
+  with >= 3 reads while it is loaded). A shared scratch folder instead keeps the reference indexes
+  (`<tmp>/mmt/refs/`) between jobs. Work folders (`<tmp>/mmt/<OUT name>_<key>/MGScall_<mode>/<S>`, one per output
+  folder, so output folders can share a `--tmp`) are removed when the sample ends - done, failed, or stopped by
+  scancel / the time limit. `--debug` keeps them (a rerun then resumes from the last finished step; a work folder left
+  by a job killed outright is resumed the same way).
 - Threads and memory come from the SLURM allocation (`--cpus-per-task`, `--mem`) unless `-t` / `--mem` are given.
 - Jobs may run at the same time on the same OUT: a sample is locked while it is processed (`_state/<S>.lock`); a lock
   of a job that no longer exists in `squeue` is taken over.
-- Terminal / `sbatch` output: a start line, the plan and an end line. Everything else is in
+- Terminal / `sbatch` output: a start line, the plan and an end line. The output folder's own log `OUT/mmt.log`
+  gets the run's start, the plan per MGS (where it is present, to do / up to date), one line per sample with every
+  MGS's outcome, failures with their reason, and the end. Everything else is in
   `OUT/logs/MGScall/<mode>/<date>_<job>.log` (+ `ipdSummary/<S>.log`).

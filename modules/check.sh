@@ -31,19 +31,19 @@ module_main() {
              MMT_DUCKDB MMT_MINIMAP2 MMT_THREADS MMT_MEM_GB; do
         printf '  %-16s %s\n' "$v" "${!v:-(empty)}"
     done
-    while read -r v; do printf '  %-24s %s\n' "$v" "${!v}"; done < <(compgen -v MGSCALL_; compgen -v DEREP_)
+    while read -r v; do printf '  %-24s %s\n' "$v" "${!v}"; done < <(compgen -v MGSCALL_; compgen -v DEREP_; compgen -v CTGMETH_)
     resolve_resources
     echo "  -> resources: $THREADS threads, $MEM_GB GB${SLURM_JOB_ID:+ (SLURM job $SLURM_JOB_ID)}"
     echo
     echo "== tools"
     setup_tools
     tool_versions | sed 's/^/  /'
-    echo "  all tools found, samtools has mpileup --reverse-del, python has pysam"
+    echo "  all tools found, samtools has mpileup --reverse-del, python has pysam + pyarrow + numpy"
     "$PYTHON" -c 'import sys, pyarrow, edlib; assert sys.version_info >= (3, 10)' 2> /dev/null \
-        && echo "  dereplicate-contigs: python >= 3.10 with pyarrow + edlib" \
-        || echo "  WARNING: dereplicate-contigs needs python >= 3.10 with pyarrow + edlib ($PYTHON)"
+        && echo "  derep-ctg / ctg-meth: python >= 3.10 with pyarrow + edlib" \
+        || echo "  WARNING: derep-ctg and ctg-meth need python >= 3.10 with pyarrow + edlib ($PYTHON)"
     command -v "${MMT_MINIMAP2:-minimap2}" > /dev/null && echo "  minimap2   $(command -v "${MMT_MINIMAP2:-minimap2}")" \
-        || echo "  WARNING: minimap2 '${MMT_MINIMAP2:-minimap2}' not found (dereplicate-contigs with DEREP_IDENTITY=1)"
+        || echo "  WARNING: minimap2 '${MMT_MINIMAP2:-minimap2}' not found (derep-ctg with DEREP_IDENTITY=1)"
     echo
     echo "== inputs"
     resolve_inputs
@@ -52,6 +52,7 @@ module_main() {
     echo "  GeneCat MGS  $MVG ($(zcat "$MVG" | tail -n +2 | wc -l) MAG rows)"
     if [[ -n ${MMT_OUT:-} ]]; then
         resolve_out
+        MLOG_CMD="check"; MLOG_ON=1          # an index (re)built here is noted in OUT/mmt.log
         echo
         echo "== index ($MMT_OUT/index)"
         ensure_index > /dev/null

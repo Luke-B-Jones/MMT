@@ -42,33 +42,40 @@ EXPECT = {"mag-rep": {("MGS.0", "S1"), ("MGS.1", "S2"), ("MGS.1", "S2.run2")},
           "mgs-rep": {("MGS.0", s) for s in ("S1", "S2", "S2.run2", "S3")} | {("MGS.1", s) for s in ("S1", "S2", "S2.run2")}}
 
 # ---- read -> MAG index
-for f in sorted(glob.glob(os.path.join(out, "index", "reads", "sample=*", "data.parquet"))):
-    s = f.split("sample=")[1].split("/")[0]
+for f in sorted(glob.glob(os.path.join(out, "index", "reads", "*.parquet"))):
+    s = os.path.basename(f)[:-len(".parquet")]
     rows = q(f"SELECT read, MGS, MAG, is_rep, dup FROM read_parquet('{f}')")
     wrong = [r for r in rows if T["reads"].get(r["read"]) not in SPECIES.get(r["MGS"], ())]
-    flagged = [r for r in rows if T["flag"].get(r["read"], 0) & 0x600]
-    check(not wrong and not flagged and rows, f"reads {s}: {len(rows)} assigned, {len(wrong)} to a wrong species, "
-          f"{len(flagged)} QC-fail/duplicate used")
+    flagged = [r for r in rows if T["flag"].get(r["read"], 0) & 0x200]
+    dupok = all((r["dup"] == "true") == bool(T["flag"].get(r["read"], 0) & 0x400) for r in rows)
+    check(not wrong and not flagged and dupok and rows, f"reads {s}: {len(rows)} assigned, {len(wrong)} to a wrong species, "
+          f"{len(flagged)} QC-fail kept, duplicate flags {'right' if dupok else 'WRONG'}")
     for m, sp in SPECIES.items():   # every unflagged, primary-mapped truth read of the species is found
         want = {r for r, n in T["reads"].items() if r.startswith(f"m84_{s}/") and n in sp
-                and r in T["flag"] and not T["flag"][r] & 0x600}
+                and r in T["flag"] and not T["flag"][r] & 0x200}
         got = {r["read"] for r in rows if r["MGS"] == m}
         if want:
             check(len(got & want) >= 0.97 * len(want), f"reads {s} {m}: {len(got & want)}/{len(want)} truth reads assigned")
 
 for mode in modes:
     D = os.path.join(out, "MGScall", mode)
-    parts = {(p.split("MGS=")[1].split("/")[0], p.split("sample=")[1].split("/")[0])
-             for p in glob.glob(os.path.join(D, "MGS=*", "sample=*", "data.parquet"))}
+    parts = {(p.split("/")[-2], os.path.basename(p)[:-len(".parquet")]) for p in glob.glob(os.path.join(D, "*", "*.parquet"))}
     check(parts == EXPECT[mode], f"{mode}: results for {sorted(parts)}")
-    cols = q(f"DESCRIBE SELECT * FROM read_parquet('{D}/*/*/*.parquet', hive_partitioning=true)")
-    want_cols = ["contig", "pos", "strand", "base", "coverage", "score", "ipdRatio", "tMean", "tErr", "modelPrediction",
-                 "frac", "fracLow", "fracUp", "call", "identificationQv", "pile_depth", "n_ref", "top_alt", "n_alt",
-                 "ctx_alt_pct", "ctx_alt_n", "clip_ctx_n", "MGS", "sample"]
+    check(not glob.glob(os.path.join(D, "MGS=*")), f"{mode}: no folder of the old layout left")
+    cols = q(f"DESCRIBE SELECT * FROM read_parquet('{D}/*/*.parquet')")
+    want_cols = ["MGS", "sample", "contig", "pos", "strand", "base", "coverage", "score", "ipdRatio", "tMean", "tErr",
+                 "modelPrediction", "frac", "fracLow", "fracUp", "call", "identificationQv", "pile_depth", "n_ref", "top_alt",
+                 "n_alt", "ctx_alt_pct", "ctx_alt_n", "clip_ctx_n"]
     check([c["column_name"] for c in cols] == want_cols, f"{mode}: columns {[c['column_name'] for c in cols]}")
-    bad = q(f"""SELECT count(*) n FROM read_parquet('{D}/*/*/*.parquet', hive_partitioning=true)
-               WHERE base NOT IN ('A','C') OR coverage < 3 OR strand NOT IN ('+','-') OR pile_depth < coverage""")[0]["n"]
-    check(bad == "0", f"{mode}: rows with a non-A/C base, coverage < 3, bad strand or pile_depth < coverage: {bad}")
+    bad = q(f"""SELECT count(*) n FROM read_parquet('{D}/*/*.parquet', filename = true)
+               WHERE base NOT IN ('A','C') OR coverage < 3 OR strand NOT IN ('+','-') OR pile_depth < coverage
+                  OR filename NOT LIKE '%/' || MGS || '/' || sample || '.parquet'""")[0]["n"]
+    check(bad == "0", f"{mode}: rows with a non-A/C base, coverage < 3, bad strand, pile_depth < coverage or MGS/sample "
+          f"not matching the file: {bad}")
+    uns = q(f"""SELECT count(*) n FROM (SELECT filename, pos, contig, lag(contig) OVER w pc, lag(pos) OVER w pp
+               FROM read_parquet('{D}/*/*.parquet', filename = true, file_row_number = true)
+               WINDOW w AS (PARTITION BY filename ORDER BY file_row_number)) WHERE contig = pc AND pos < pp""")[0]["n"]
+    check(uns == "0", f"{mode}: rows out of contig / position order inside files: {uns}")
     # state files agree with the results
     for s in sorted({s for _, s in EXPECT[mode]}):
         st = list(csv.DictReader(open(os.path.join(D, "_state", f"{s}.tsv")), delimiter="\t"))
@@ -80,7 +87,7 @@ for mode in modes:
     for m, s in sorted(parts):
         seq, names, motif = REP[m]
         sites = motif_sites(seq, names, motif)
-        rows = q(f"""SELECT contig, pos, strand, frac, call, ipdRatio FROM read_parquet('{D}/MGS={m}/sample={s}/data.parquet')
+        rows = q(f"""SELECT contig, pos, strand, frac, call, ipdRatio FROM read_parquet('{D}/{m}/{s}.parquet')
                     WHERE base = 'A' AND coverage >= 11 AND ctx_alt_pct = 0""")
         on = [r for r in rows if (r["contig"], int(r["pos"]), r["strand"]) in sites]
         off = [r for r in rows if (r["contig"], int(r["pos"]), r["strand"]) not in sites]
@@ -103,7 +110,7 @@ if "mgs-rep" in modes:
     ia, il = T["island"]
     snp = {("S1__C1", i + 1) for i in range(len(A[0])) if A2[0][i if i < ia else i + il] != A[0][i]}
     snp |= {("S1__C2", i + 1) for i in range(len(A[1])) if A2[1][i] != A[1][i]}
-    f = os.path.join(out, "MGScall", "mgs-rep", "MGS=MGS.0", "sample=S3", "data.parquet")
+    f = os.path.join(out, "MGScall", "mgs-rep", "MGS.0", "S3.parquet")
     rows = q(f"SELECT contig, pos, strand, pile_depth, n_ref, ctx_alt_pct, clip_ctx_n FROM read_parquet('{f}') WHERE coverage >= 5")
     at = [r for r in rows if (r["contig"], int(r["pos"])) in snp]
     flagged = sum(int(r["n_ref"]) <= 0.2 * int(r["pile_depth"]) for r in at) / max(1, len(at))

@@ -2,8 +2,9 @@
 """MATAFILER4 / GeneCat layout for MMT.
 
   index   map + MATAFILER4 run + GeneCat MAGvsGC + bin files + GeneCat representative FASTAs -> tables in --out
-  assign  one sample's CRAM (samtools view text on stdin) -> which read lies on which MAG / MGS     -> tsv
-  split   a by-strand BAM -> one unaligned BAM per MGS, holding the reads chosen for that MGS
+  assign  one sample's CRAM (samtools view -h text on stdin) -> which read lies on which MAG / MGS (tsv) + read depth
+          of every MGS-MAG contig in 1 kb bins (tsv)
+  split   a by-strand BAM -> one unaligned BAM per group (MGS or MAG: 2nd column of --reads)
 
 Names and rules follow GeneCat's own code (Mods/Binning.pm getRepresentBins + createBinCtgs, Mods/GenoMetaAss.pm
 readMapS), so MMT finds exactly the contigs GeneCat used:
@@ -18,6 +19,7 @@ Every representative's contigs from the bin file must equal GeneCat's FASTA, els
 wrong). units.tsv = one row per assembly x MGS with a MAG there, with checksums of the contig lists, so a result is
 redone only when the contigs behind it change (not when unrelated lines of the map or MAGvsGC change). Reads: MATAFILER4 keeps every aligned read in <MF4 run>/<SmplID>/mapping/<SmplID>-smd.cram; alignments that
 failed its filter are flagged 0x200 (QC fail), duplicates 0x400.
+movies.tsv = the read groups of every raw BAM (movie, chemistry): the batch key for kinetics.
 """
 import argparse, collections, glob, gzip, hashlib, os, re, sys
 
@@ -81,6 +83,26 @@ def first_line(path):
         return fh.readline().strip()
 
 
+MOVIE_COLS = ("rg_id", "movie", "platform", "read_type", "binding_kit", "sequencing_kit", "basecaller", "frame_rate")
+
+
+def movies(raw):
+    """read groups of a raw BAM header: [(rg_id, movie, platform, read_type, binding_kit, sequencing_kit, basecaller,
+    frame_rate)] ; None when the header cannot be read"""
+    try:
+        import pysam
+        with pysam.AlignmentFile(raw, check_sq=False) as f:
+            rgs = f.header.to_dict().get("RG", [])
+    except Exception:
+        return None
+    out = []
+    for rg in rgs:
+        ds = dict(kv.split("=", 1) for kv in str(rg.get("DS", "")).split(";") if "=" in kv)
+        out.append((rg.get("ID", ""), rg.get("PU", ""), rg.get("PM", ""), ds.get("READTYPE", ""), ds.get("BINDINGKIT", ""),
+                    ds.get("SEQUENCINGKIT", ""), ds.get("BASECALLERVERSION", ""), ds.get("FRAMERATEHZ", "")))
+    return out
+
+
 def rep_fasta_name(mgs, mag):   # Binning.pm createBinCtgs
     name = re.sub(r"\.gz$", "", f"{mgs}.ctgs.{mag}", flags=re.I)
     if not re.search(r"\.(fa|fna|fasta)$", name, flags=re.I):
@@ -127,6 +149,19 @@ def index(a):
             report(f"  sample {s}: {v['status']}")
     if n_ok == 0:
         fatal.append("no usable sample (raw BAM + CRAM + assembly)")
+    # read groups (movie, chemistry) of every raw BAM: the batch key of kinetics
+    mov, unread = [], []
+    for s, v in sample.items():
+        if not v["raw"]:
+            continue
+        seen.append(v["raw"])
+        m = movies(v["raw"])
+        if m is None:
+            unread.append(s)
+        else:
+            mov += [(s,) + r for r in m]
+    report(f"raw BAM read groups: {len(mov)} in {len(sample) - len(unread)} BAMs"
+           + (f"   header not readable: {len(unread)} (e.g. {unread[0]})" if unread else ""))
 
     # ---- MAGvsGC (GeneCat getRepresentBins)
     mvg = os.path.join(a.genecat, f"Bin_{a.binner}", "MAGvsGC.txt.gz")
@@ -284,6 +319,10 @@ def index(a):
         o.write("MGS\tcontig\tlength\n")
         for r in rep_ctg_rows:
             o.write("\t".join(map(str, r)) + "\n")
+    with open(os.path.join(a.out, "movies.tsv"), "w") as o:
+        o.write("sample\t" + "\t".join(MOVIE_COLS) + "\n")
+        for r in mov:
+            o.write("\t".join(map(str, r)) + "\n")
     with open(os.path.join(a.out, "inputs.tsv"), "w") as o:      # same size:mtime format as common.sh stamp()
         for f in sorted(set(seen)):
             st = os.stat(f) if os.path.exists(f) else None
@@ -296,7 +335,29 @@ def index(a):
 
 
 # ============================================================================ assign
+RE_SPAN = re.compile(r"(\d+)[MDN=X]")
+BIN = 1000
+
+
+def add_depth(d, p0, span, clen):
+    """reference bp of an alignment [p0, p0 + span) (0-based) into 1 kb bins d"""
+    p1 = min(p0 + span, clen)                              # end exclusive
+    if span <= 0 or p1 <= p0:
+        return
+    b0, b1 = p0 // BIN, (p1 - 1) // BIN
+    if b0 == b1:
+        d[b0] += p1 - p0
+    else:
+        d[b0] += BIN * (b0 + 1) - p0
+        for b in range(b0 + 1, b1):
+            d[b] += BIN
+        d[b1] += p1 - BIN * b1
+
+
 def assign(a):
+    """every primary, non-QC-fail alignment on an MGS-MAG contig -> one row (duplicates kept, flagged: consumers
+    decide) ; depth = reference bp of the primary and supplementary, non-QC-fail, non-duplicate alignments per 1 kb bin
+    of every MGS-MAG contig (zero bins included: contig lengths from the CRAM header)"""
     c2 = {}
     with gzip.open(a.contigs, "rt") as fh:
         next(fh)
@@ -304,22 +365,32 @@ def assign(a):
             asm, ctg, mag, mgs, isrep = line.rstrip("\n").split("\t")
             if asm == a.assembly:
                 c2[ctg] = (mgs, mag, isrep)
-    n, seen = collections.Counter(), set()
+    n, seen, clen, depth = collections.Counter(), set(), {}, {}
     with open(a.out, "w") as o:
         o.write("read\tMGS\tMAG\tis_rep\tcontig\tpos\tmapq\tdup\n")
         for line in sys.stdin:
-            f = line.split("\t", 6)
-            q, flag, ctg, pos, mapq = f[0], int(f[1]), f[2], f[3], f[4]
-            if flag & 0x904:                       # unmapped / secondary / supplementary (normally removed upstream)
+            if line[0] == "@":
+                if line.startswith("@SQ"):
+                    t = dict(x.split(":", 1) for x in line.rstrip("\n").split("\t")[1:] if ":" in x)
+                    if t.get("SN") in c2:
+                        clen[t["SN"]] = int(t["LN"])
+                        depth[t["SN"]] = [0] * ((int(t["LN"]) + BIN - 1) // BIN)
+                continue
+            f = line.split("\t", 7)
+            q, flag, ctg, pos, mapq, cig = f[0], int(f[1]), f[2], f[3], f[4], f[5]
+            if flag & 0x104:                       # unmapped / secondary (normally removed upstream)
+                continue
+            if flag & 0x800:                       # supplementary: depth only
+                d = depth.get(ctg)
+                if d is not None and not flag & 0x600:
+                    n["depth_supplementary_alignments"] += 1
+                    add_depth(d, int(pos) - 1, sum(int(x) for x in RE_SPAN.findall(cig)), clen[ctg])
                 continue
             n["cram_primary_alignments"] += 1
             if flag & 0x200:
                 n["skipped_qcfail_0x200"] += 1
                 continue
             dup = 1 if flag & 0x400 else 0
-            if dup and not a.keep_dup:
-                n["skipped_duplicate_0x400"] += 1
-                continue
             hit = c2.get(ctg)
             if hit is None:
                 n["not_on_an_MGS_MAG"] += 1
@@ -330,14 +401,24 @@ def assign(a):
             seen.add(q)
             n["assigned_reads"] += 1
             n["assigned_reads_on_representative"] += hit[2] == "1"
-            n["assigned_duplicates_kept"] += dup
+            n["assigned_duplicates"] += dup
             o.write(f"{q}\t{hit[0]}\t{hit[1]}\t{hit[2]}\t{ctg}\t{pos}\t{mapq}\t{dup}\n")
+            d = depth.get(ctg)
+            if dup or d is None:
+                continue
+            add_depth(d, int(pos) - 1, sum(int(x) for x in RE_SPAN.findall(cig)), clen[ctg])
     n["mgs_contigs_in_assembly"] = len(c2)
+    n["mgs_contigs_in_cram_header"] = len(clen)
     with open(a.stats, "w") as s:
-        for k in ("cram_primary_alignments", "skipped_qcfail_0x200", "skipped_duplicate_0x400", "skipped_repeated_read",
-                  "not_on_an_MGS_MAG", "assigned_reads", "assigned_reads_on_representative",
-                  "assigned_duplicates_kept", "mgs_contigs_in_assembly"):
+        for k in ("cram_primary_alignments", "skipped_qcfail_0x200", "skipped_repeated_read", "not_on_an_MGS_MAG",
+                  "assigned_reads", "assigned_reads_on_representative", "assigned_duplicates", "mgs_contigs_in_assembly",
+                  "mgs_contigs_in_cram_header", "depth_supplementary_alignments"):
             s.write(f"{k}\t{n[k]}\n")
+    with open(a.depth, "w") as o:
+        o.write("MGS\tMAG\tcontig\tc_start\tc_end\tbp\n")
+        for c in sorted(depth):
+            for b, v in enumerate(depth[c]):
+                o.write(f"{c2[c][0]}\t{c2[c][1]}\t{c}\t{b * BIN + 1}\t{min(clen[c], (b + 1) * BIN)}\t{v}\n")
     if n["cram_primary_alignments"] == 0:
         stop("no primary alignment read from the CRAM")
     if c2 and n["assigned_reads"] == 0 and n["not_on_an_MGS_MAG"] > 0:
@@ -371,7 +452,7 @@ def split(a):
             for o in outs.values():
                 o.close()
     with open(os.path.join(a.outdir, "counts.tsv"), "w") as o:
-        o.write("MGS\tmolecules\tpseudo_reads\n")
+        o.write("group\tmolecules\tpseudo_reads\n")
         for m in groups:
             if counts[m]:
                 os.replace(os.path.join(a.outdir, f".{m}.bam"), os.path.join(a.outdir, f"{m}.bam"))
@@ -390,8 +471,7 @@ def main():
     p.add_argument("--map", required=True); p.add_argument("--binner", default="SB"); p.add_argument("--out", required=True)
     p = sp.add_parser("assign")
     p.add_argument("--contigs", required=True); p.add_argument("--assembly", required=True)
-    p.add_argument("--keep-dup", type=int, default=0); p.add_argument("--out", required=True)
-    p.add_argument("--stats", required=True)
+    p.add_argument("--out", required=True); p.add_argument("--stats", required=True); p.add_argument("--depth", required=True)
     p = sp.add_parser("split")
     p.add_argument("--bam", required=True); p.add_argument("--reads", required=True)
     p.add_argument("--outdir", required=True); p.add_argument("--max-open", type=int, default=400)

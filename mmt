@@ -19,22 +19,31 @@ Usage: mmt <command> [options]
 Commands
   MGScall   methylation of each MGS on its representative MAG, per sample
               --mgs-rep  reads of every MAG of the MGS   |   --mag-rep  reads of the representative MAG only
-  dereplicate-contigs   each MGS as a short list of collinear blocks ("dereplicated contigs") with every
-              occurrence in every MAG, representative sequences and block order along the contigs
+  derep-ctg each MGS as a short list of collinear blocks ("dereplicated contigs") with every occurrence in
+              every MAG down to the base, block sequences and block order along the contigs
+              (also: dereplicate-contigs, derep)
+  ctg-meth  methylation of every MAG's own contigs per sample, lifted onto the derep-ctg blocks, with read
+              sets per junction (conformation) of a contig
   check     show the settings in effect, check tools and inputs (with -o: build / refresh the index there)
+  status    what is done per MGS in an output folder: per sample done / absent / not yet (also into OUT/mmt.log)
   version   print the version (and git commit)
   help      this text, or 'mmt help <command>'
 
 Settings: config/mmt.conf (defaults) -> config/site.conf (your cluster) -> \$MMT_CONFIG -> --config FILE
-          -> command-line options. Results folder (-o) is reused by every run and every command.
+          -> command-line options. Results folder (-o) is reused by every run and every command: one folder per
+          command inside it (MGScall/<mode>/, derep-ctg/, ctg-meth/), index/, logs/, and OUT/mmt.log = the log of
+          every run (plan per MGS, each sample x MGS outcome, failures). Work folders (--tmp) are removed when a
+          sample ends; --debug keeps them.
 EOF
 }
 
 module_file() {   # module_file COMMAND -> modules/<file>.sh
     case $1 in
         MGScall|mgscall) echo "$MMT_HOME/modules/MGScall.sh" ;;
-        dereplicate-contigs|derep) echo "$MMT_HOME/modules/dereplicate-contigs.sh" ;;
+        derep-ctg|dereplicate-contigs|derep) echo "$MMT_HOME/modules/derep-ctg.sh" ;;
+        ctg-meth|ctgmeth) echo "$MMT_HOME/modules/ctg-meth.sh" ;;
         check)           echo "$MMT_HOME/modules/check.sh" ;;
+        status)          echo "$MMT_HOME/modules/status.sh" ;;
         *) return 1 ;;
     esac
 }

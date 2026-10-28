@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""MMT dereplicate-contigs: each MGS as a short list of collinear blocks ("dereplicated contigs").
+"""MMT derep-ctg: each MGS as a short list of collinear blocks ("dereplicated contigs").
 
   prep     once per MMT index: catalogue members + prodigal genes of every MGS-MAG contig    -> PREP/
   plan     which MGS need (re)computing                                                      -> stdout
-  mgs      one MGS: families -> anchors -> blocks -> instances -> representatives -> links  -> OUT/MGS=<m>/
+  mgs      one MGS: families -> anchors -> blocks -> instances -> representatives -> links -> lift  -> OUT/<m>/
   summary  OUT/summary.tsv from every MGS folder
 
 A block is an ordered run of gene families that sits in the same order and orientation in the MAGs of an MGS.
-Method and reasons: docs/dereplicate-contigs.md. The rules follow Panaroo (context-aware merging of gene variants,
+Method and reasons: docs/derep-ctg.md. The rules follow Panaroo (context-aware merging of gene variants,
 low-support and contig-end filtering, paralog care) and PPanGGOLiN (multi-copy families bridged, persistent backbone
 vs variable regions, incomplete-aware comparison at contig ends), on MATAFILER4's own cohort-wide gene catalogue.
 """
@@ -16,6 +16,7 @@ import argparse, bisect, collections, csv, gzip, hashlib, itertools, json, os, r
 csv.field_size_limit(1 << 30)
 COMP = str.maketrans("ACGTNacgtn", "TGCANtgcan")
 RE_ID, RE_PART = re.compile(r"(?:^|;)ID=\d+_(\d+)"), re.compile(r"partial=(\d\d)")
+RE_CIG = re.compile(r"(\d+)([MIDNSHP=X])")
 CODE = dict(zip((a + b + c for a in "TCAG" for b in "TCAG" for c in "TCAG"), "FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG"))
 
 
@@ -36,19 +37,39 @@ def num(x, d=float("nan")):   # "NA", "", "nan" -> d
 # column types by name, so that every table has the same schema in every MGS (also when empty): string, float, bool,
 # int32, int8 ; any other column is int64 (a `types` argument overrides)
 PQ_TYPES = dict(str="MGS MAG contig block block_a block_b tier samples strand start_status end_status orientation catalogue rep_gene "
-                    "rep_MAG rep_contig rep_strand role gene cls path MAGs cigar",
+                    "rep_MAG rep_contig rep_strand role gene cls path MAGs seq nb5_key nb3_key",
                 float="frac identity aligned_frac prevalence prevalence_adj median_identity shared_frac completeness contamination "
-                      "frac_core frac_blocks",
-                bool="complete is_rep circular rep_complete rep_is_MGS_rep partial terminal is_MGS_rep mixed",
-                int32="pos pos_a pos_b slot_after", int8="end_a end_b")
+                      "frac_core frac_blocks gc gc_skew",
+                bool="complete is_rep circular rep_complete rep_is_MGS_rep partial terminal is_MGS_rep mixed dup_in_mag",
+                int32="slot slot_a slot_b slot_after instance host_instance host_slot nb5_instance nb3_instance c_start c_end b_start "
+                      "w_start w_end first_slot last_slot",
+                int16="a c g t", int8="end_a end_b ori")
+DELTA = {"c_start", "c_end", "b_start", "w_start", "w_end", "start", "end"}   # positions: delta encoding, no dictionary
+
+
+def pq_type(c, types=None):
+    import pyarrow as pa
+    by = {x: getattr(pa, {"str": "string", "float": "float64", "bool": "bool_"}.get(k, k))() for k, v in PQ_TYPES.items() for x in v.split()}
+    return (types or {}).get(c) or by.get(c, pa.int64())
+
+
+def pq_writer(path, schema):
+    """parquet writer with MMT's encodings: positions delta-encoded, sequences plain, the rest dictionary-encoded"""
+    import pyarrow as pa, pyarrow.parquet as pq
+    d = [f.name for f in schema if f.name in DELTA and pa.types.is_integer(f.type)]
+    try: return pq.ParquetWriter(path, schema, compression="zstd", use_dictionary=[f.name for f in schema if f.name not in d and f.name != "seq"],
+                                 column_encoding={c: "DELTA_BINARY_PACKED" for c in d})
+    except (TypeError, ValueError, NotImplementedError, pa.ArrowNotImplementedError): return pq.ParquetWriter(path, schema, compression="zstd")
 
 
 def write_pq(cols, path, types=None):
     """dict of equal-length lists -> zstd parquet (temp name, then rename)"""
-    import pyarrow as pa, pyarrow.parquet as pq
-    by = {c: getattr(pa, {"str": "string", "float": "float64", "bool": "bool_"}.get(k, k))() for k, v in PQ_TYPES.items() for c in v.split()}
-    t = pa.table({k: pa.array(v, type=(types or {}).get(k) or by.get(k, pa.int64())) for k, v in cols.items()})
-    tmp = f"{path}.{os.getpid()}.tmp"; pq.write_table(t, tmp, compression="zstd"); os.replace(tmp, path)
+    import pyarrow as pa
+    t = pa.table({k: pa.array(v, type=pq_type(k, types)) for k, v in cols.items()})
+    tmp = f"{path}.{os.getpid()}.tmp"
+    w = pq_writer(tmp, t.schema)
+    w.write_table(t); w.close()
+    os.replace(tmp, path)
 
 
 def rel(p, root):   # paths inside the prep folder are stored relative to it (the folder is built elsewhere, then renamed)
@@ -285,12 +306,12 @@ def cmd_plan(a):
         for m in sorted(sel, key=lambda m: (-nm[m], m)):
             k = min(range(n), key=lambda j: (load[j], j)); part[m] = k; load[k] += nm[m] + 1
         sel = [m for m in sel if part[m] == i - 1]
-    if not (a.mgs or a.part):
+    if not (a.mgs or a.part):          # result folders (they hold a .fp) of MGS that are gone
         for d in sorted(os.listdir(a.out)) if os.path.isdir(a.out) else []:
-            if d.startswith("MGS=") and d[4:] not in fp: print(f"{d[4:]}\tstale\t-\t0")
+            if not d.startswith((".", "_")) and d not in fp and os.path.isfile(f"{a.out}/{d}/.fp"): print(f"{d}\tstale\t-\t0")
     for m in sel:
         f = md5(f"{a.base_fp}|{m}|" + ",".join(sorted(fp[m])))
-        d = f"{a.out}/MGS={m}"
+        d = f"{a.out}/{m}"
         cur = not a.force and os.path.isfile(f"{d}/summary.tsv") and os.path.isfile(f"{d}/.fp") and open(f"{d}/.fp").read().strip() == f
         print(f"{m}\t{'current' if cur else 'todo'}\t{f}\t{nm[m]}")
 
@@ -597,6 +618,8 @@ class MGS:
                 k = (ea, eb) if ea <= eb else (eb, ea)
                 term = all((p == 0 and sd == 5) or (p == len(s.B[b][0]) - 1 and sd == 3) for b, p, sd in k)
                 L = s.links[k]; L[0].add(x["mag"]); L[1].append(y["start"] - x["end"] - 1); L[2] = term
+            for k_, x in enumerate(top):                # neighbours along the contig (top-level instances)
+                x["nbL"], x["nbR"] = (top[k_ - 1] if k_ else None), (top[k_ + 1] if k_ + 1 < len(top) else None)
 
     # ------------------------------------------------------------------ 5. representatives + sequences
     def representatives(s):
@@ -618,42 +641,147 @@ class MGS:
                                                s.MAG[s.mags[r["mag"]]]["is_rep"] == "1", s.mags[r["mag"]], -r["start"]))
         s.seqs = {bi: seq_of(r) for bi, r in s.rep.items()}
 
-    # ------------------------------------------------------------------ 6. identity
-    def identity(s):
-        """every instance against its block's sequence (minimap2 asm20, base level): identity = matches / aligned bases
-        (indels excluded: they show in insert_bp and aligned_frac) ; aligned_frac = share of the instance aligned"""
-        s.ident, s.aln = {}, []
-        if not (s.S["identity"] and s.a.minimap2 and s.B): return
-        tmp = f"{s.a.tmp}/derep_{s.m}_{os.getpid()}"; os.makedirs(tmp, exist_ok=True)
-        try: s._identity(tmp)
-        finally: shutil.rmtree(tmp, ignore_errors=True)
+    # ------------------------------------------------------------------ 6. base-level lift, polished block sequences
+    def lift(s):
+        """every instance aligned to its block's representative sequence (minimap2 asm20 --eqx ; per instance the hits
+        by score, each column used once on both axes). The block sequence is then POLISHED: a substitution wherever more
+        than half of the aligned instances (representative included) carry another base - so no one MAG's private
+        differences shape every comparison. lift = runs of identical bases between each instance and its polished block
+        (exact-match segments, 1-based): block_pos = b_start + (pos - c_start) (ori +1) or b_start + (c_end - pos) (-1).
+        Segments of different instances never overlap on a contig (the smaller instance keeps the bases: nested inserts,
+        overlapping genes at block ends). identity = identical / aligned bases ; aligned_frac = aligned / instance bases."""
+        import numpy as np
+        s.ident, s.seg, s.npol, s.pseq = {}, [], {}, dict(s.seqs)
+        if not s.B: return
+        hits = collections.defaultdict(list)
+        if s.S["identity"] and s.a.minimap2:
+            tmp = f"{s.a.tmp}/derep_{s.m}_{os.getpid()}"; os.makedirs(tmp, exist_ok=True)
+            try: hits = s._align(tmp)
+            finally:
+                if not s.a.keep_tmp: shutil.rmtree(tmp, ignore_errors=True)
+        CODE_ = np.full(256, 4, np.uint8)
+        for i, ch in enumerate(b"ACGT"): CODE_[ch] = i
+        COMPC, BASES = np.array([3, 2, 1, 0, 4], np.uint8), np.frombuffer(b"ACGTN", np.uint8)
+        enc = lambda q: CODE_[np.frombuffer(q.encode(), np.uint8)]
 
-    def _identity(s, tmp):
+        def chunks(r, L):
+            """aligned columns of instance r on its block: [(qa, ta, sgn)] ; qa = 0-based on the instance's sequence in
+            block orientation, ta = 0-based on the block, sgn = +1 / -1 (hit on the reverse strand: qa runs backwards)"""
+            if r is s.rep[r["block"]]:
+                return [(np.arange(L, dtype=np.int64), np.arange(L, dtype=np.int64), 1)]
+            out, qlen = [], r["end"] - r["start"] + 1
+            qc, tc = np.zeros(qlen, bool), np.zeros(L, bool)
+            for _, qs, qe, sg, ts, cg in sorted(hits.get(r["id"], []), key=lambda h: -h[0]):
+                qa_, ta_, t, q = [], [], ts, (qs if sg > 0 else qe - 1)
+                run = 0
+                for n, op in RE_CIG.findall(cg + "0I"):     # sentinel flushes the last aligned run
+                    n = int(n)
+                    if op in "M=X": run += n; continue
+                    if run:
+                        ta_.append(np.arange(t, t + run)); qa_.append(q + sg * np.arange(run)); t += run; q += sg * run; run = 0
+                    if op == "D": t += n
+                    elif op == "I": q += sg * n
+                if not ta_: continue
+                qa, ta = np.concatenate(qa_), np.concatenate(ta_)
+                k = ~qc[qa] & ~tc[ta]
+                qa, ta = qa[k], ta[k]; qc[qa] = True; tc[ta] = True
+                if len(qa): out.append((qa, ta, sg))
+            return out
+
+        for bi in range(len(s.B)):
+            rs, R = s.by_block[bi], s.seqs[bi]
+            L, Rc = len(R), enc(R)
+            cnt, buf, nbuf = np.zeros(5 * L, np.int64), [], 0  # pass 1: votes per block column (base * L + column)
+            for r in rs:
+                qcode = enc(s.seq_of(r))
+                for qa, ta, sg in chunks(r, L):
+                    b = qcode[qa] if sg > 0 else COMPC[qcode[qa]]
+                    buf.append(b.astype(np.int64) * L + ta); nbuf += len(ta)
+                    if nbuf > 5e7: cnt += np.bincount(np.concatenate(buf), minlength=5 * L); buf, nbuf = [], 0
+            if buf: cnt += np.bincount(np.concatenate(buf), minlength=5 * L)
+            cnt = cnt.reshape(5, L)
+            tot, best = cnt[:4].sum(0), cnt[:4].argmax(0)
+            sub = (cnt[:4].max(0) * 2 > tot) & (best != Rc)
+            P = Rc.copy(); P[sub] = best[sub]
+            s.npol[bi] = int(sub.sum()); s.pseq[bi] = BASES[P].tobytes().decode()
+            for r in rs:                                       # pass 2: exact-match runs against the polished block
+                qcode, n_al, n_eq = enc(s.seq_of(r)), 0, 0
+                for qa, ta, sg in chunks(r, L):
+                    b = qcode[qa] if sg > 0 else COMPC[qcode[qa]]
+                    eq = (b == P[ta]) & (b < 4)
+                    n_al += len(qa); n_eq += int(eq.sum())
+                    cont = (np.diff(ta) == 1) & (np.diff(qa) == sg)
+                    st = np.flatnonzero(eq & ~np.r_[False, eq[:-1] & cont])
+                    en = np.flatnonzero(eq & ~np.r_[eq[1:] & cont, False])
+                    ori = sg * r["strand"]
+                    for i, j in zip(st, en):
+                        c0 = r["start"] + qa[i] if r["strand"] > 0 else r["end"] - qa[i]
+                        c1 = r["start"] + qa[j] if r["strand"] > 0 else r["end"] - qa[j]
+                        s.seg.append((r["id"], int(min(c0, c1)), int(max(c0, c1)), int(ta[i]) + 1, ori))   # b_start = lowest block pos
+                if n_al: s.ident[r["id"]] = (n_eq / n_al, n_al / (r["end"] - r["start"] + 1))
+        s._resolve()
+
+    def _align(s, tmp):
+        """minimap2 asm20 --eqx of every non-representative instance (block orientation) against the representatives ->
+        {instance: [(AS, q_start, q_end, +1/-1, t_start, cigar)]} on its own block only"""
         with open(f"{tmp}/ref.fa", "w") as o:
             for bi in range(len(s.B)): o.write(f">{bi}\n{s.seqs[bi]}\n")
-        n = 0
+        n, hits = 0, collections.defaultdict(list)
         with open(f"{tmp}/q.fa", "w") as o:
             for r in s.I:
                 if r is not s.rep[r["block"]]: o.write(f">{r['id']}\n{s.seq_of(r)}\n"); n += 1
-        if n:
-            p = subprocess.run([s.a.minimap2, "-x", "asm20", "-c", "--secondary=no", "-t", str(s.a.threads), f"{tmp}/ref.fa", f"{tmp}/q.fa"],
-                               capture_output=True, text=True)
-            if p.returncode: die(f"{s.m}: minimap2 failed: {p.stderr.strip()[-300:]}")
-            hits = collections.defaultdict(list)
-            for l in p.stdout.splitlines():
-                x = l.split("\t")
-                if int(x[5]) == s.I[int(x[0])]["block"]:
-                    cg = next((f[5:] for f in x[12:] if f.startswith("cg:Z:")), "")
-                    aligned = sum(int(n) for n, op in re.findall(r"(\d+)([MIDNSHP=X])", cg) if op in "M=X")
-                    hits[int(x[0])].append((int(x[2]), int(x[3]), int(x[9]), aligned, int(x[1])))
-                    s.aln.append((int(x[0]), int(x[2]), int(x[3]), x[4], int(x[7]), int(x[8]), int(x[9]), int(x[10]), cg))
-            for i, h in hits.items():
-                cov, a_, b_ = 0, -1, -1
-                for q0, q1 in sorted((x[0], x[1]) for x in h):
-                    if q0 > b_: cov += b_ - a_; a_, b_ = q0, q1
-                    else: b_ = max(b_, q1)
-                cov += b_ - a_
-                s.ident[i] = (sum(x[2] for x in h) / max(1, sum(x[3] for x in h)), cov / h[0][4])
+        if not n: return hits
+        p = subprocess.run([s.a.minimap2, "-x", "asm20", "-c", "--eqx", "--secondary=no", "-t", str(s.a.threads), f"{tmp}/ref.fa",
+                            f"{tmp}/q.fa"], capture_output=True, text=True)
+        if p.returncode: die(f"{s.m}: minimap2 failed: {p.stderr.strip()[-300:]}")
+        for l in p.stdout.splitlines():
+            x = l.split("\t")
+            if int(x[5]) != s.I[int(x[0])]["block"]: continue
+            tag = {f[:2]: f[5:] for f in x[12:]}
+            hits[int(x[0])].append((int(tag.get("AS", x[9])), int(x[2]), int(x[3]), 1 if x[4] == "+" else -1, int(x[7]), tag.get("cg", "")))
+        return hits
+
+    def _resolve(s):
+        """segments of different instances never overlap on a contig: instances in order of span (smallest first) keep
+        their bases, larger ones lose the overlap ; then every segment is checked against the contig sequence"""
+        inst = {r["id"]: r for r in s.I}
+        by = collections.defaultdict(list)
+        for g in s.seg: by[g[0]].append(g)
+        claimed, out = collections.defaultdict(list), []      # contig -> sorted disjoint [start, end]
+        for i in sorted(by, key=lambda i: (inst[i]["end"] - inst[i]["start"], i)):
+            c, mine = inst[i]["contig"], []
+            cl = claimed[c]
+            for _, a_, b_, bs, ori in by[i]:
+                pieces, x = [], a_
+                k = bisect.bisect_right(cl, [a_, float("inf")]) - 1
+                k = max(k, 0)
+                while k < len(cl) and cl[k][0] <= b_:
+                    u, v = cl[k]
+                    if v >= x and u <= b_:
+                        if u > x: pieces.append((x, u - 1))
+                        x = max(x, v + 1)
+                    k += 1
+                if x <= b_: pieces.append((x, b_))
+                for u, v in pieces:
+                    mine.append((i, c, u, v, bs + (u - a_) if ori > 0 else bs + (b_ - v), ori))
+            out += mine
+            for _, _, u, v, _, _ in mine:                         # claim (kept sorted and merged)
+                k = bisect.bisect_left(cl, [u, v])
+                cl.insert(k, [u, v])
+            merged = []
+            for u, v in cl:
+                if merged and u <= merged[-1][1] + 1: merged[-1][1] = max(merged[-1][1], v)
+                else: merged.append([u, v])
+            claimed[c] = merged
+        out.sort(key=lambda g: (inst[g[0]]["mag"], g[1], g[2]))
+        bad = 0
+        for i, c, u, v, bs, ori in out:                           # every base of every segment = its block base
+            r = inst[i]
+            k = s.asm[s.MAG[s.mags[r["mag"]]]["assembly"]]
+            q = s.fa[k["key"]].fetch(c, u - 1, v).upper()
+            if (q if ori > 0 else rc(q)) != s.pseq[r["block"]][bs - 1:bs - 1 + v - u + 1]: bad += 1
+        if bad: die(f"{s.m}: {bad} of {len(out)} lift segments do not match their block sequence (bug)")
+        s.seg = out
 
     # ------------------------------------------------------------------ 7. outputs
     def write(s, out):
@@ -663,43 +791,81 @@ class MGS:
         with gzip.open(f"{out}/blocks.fna.gz", "wt", compresslevel=6) as o:
             for bi in nb:
                 r = s.rep[bi]
-                o.write(f">{bid[bi]} MGS={m} tier={tier(bi)} genes={len(B[bi][0])} len={len(s.seqs[bi])} "
-                        f"rep={s.mags[r['mag']]}:{r['contig']}:{r['start']}-{r['end']}:{'+' if r['strand'] > 0 else '-'}\n")
-                q = s.seqs[bi]; o.write("".join(q[i:i + 80] + "\n" for i in range(0, len(q), 80)))
+                o.write(f">{bid[bi]} MGS={m} tier={tier(bi)} genes={len(B[bi][0])} len={len(s.pseq[bi])} "
+                        f"rep={s.mags[r['mag']]}:{r['contig']}:{r['start']}-{r['end']}:{'+' if r['strand'] > 0 else '-'} "
+                        f"polished={s.npol.get(bi, 0)}\n")
+                q = s.pseq[bi]; o.write("".join(q[i:i + 80] + "\n" for i in range(0, len(q), 80)))
         F = lambda f: [f(r) for r in I]
         isrep = lambda r: r is s.rep[r["block"]]
         complete = lambda r: r["present"] == len(B[r["block"]][0]) and r["start_status"] == r["end_status"] == "complete"
+        grp = collections.defaultdict(list)                   # copies of a block in one MAG ; dup = they share block genes
+        for r in I: grp[(r["block"], r["mag"])].append(r)
+        copies = {k: len(v) for k, v in grp.items()}
+        dupin = {r["id"] for v in grp.values() if len(v) > 1 for r in v for y in v
+                 if y is not r and y["first"] <= r["last"] and r["first"] <= y["last"]}
+
+        def nbr(r, five):
+            """neighbour at the block's 5' (five) or 3' end of instance r: (instance, key, gap bp, MAGs with that link)"""
+            if r["host"] >= 0: return r["host"], f"host:{bid[s.I[r['host']]['block']]}", None, None
+            left = (r["strand"] > 0) == five
+            y = r.get("nbL") if left else r.get("nbR")
+            if y is None: return None, "contig_end", (r["start"] - 1 if left else s.clen[r["contig"]] - r["end"]), None
+            if left:
+                ey = (y["block"], y["last"], 3) if y["strand"] > 0 else (y["block"], y["first"], 5)
+                er = (r["block"], r["first"], 5) if r["strand"] > 0 else (r["block"], r["last"], 3)
+                gap = r["start"] - y["end"] - 1
+            else:
+                ey = (y["block"], y["first"], 5) if y["strand"] > 0 else (y["block"], y["last"], 3)
+                er = (r["block"], r["last"], 3) if r["strand"] > 0 else (r["block"], r["first"], 5)
+                gap = y["start"] - r["end"] - 1
+            k = (ey, er) if ey <= er else (er, ey)
+            return y["id"], f"{bid[ey[0]]}:{ey[1]}:{ey[2]}", gap, (len(s.links[k][0]) if k in s.links else None)
+        N5, N3 = {r["id"]: nbr(r, True) for r in I}, {r["id"]: nbr(r, False) for r in I}
         write_pq(dict(MGS=[m] * len(I), instance=F(lambda r: r["id"]), block=F(lambda r: bid[r["block"]]), tier=F(lambda r: tier(r["block"])),
                       MAG=F(lambda r: s.mags[r["mag"]]), samples=F(lambda r: s.smp[r["mag"]]), contig=F(lambda r: r["contig"]),
-                      start=F(lambda r: r["start"]), end=F(lambda r: r["end"]), strand=F(lambda r: "+" if r["strand"] > 0 else "-"),
-                      first_pos=F(lambda r: r["first"]), last_pos=F(lambda r: r["last"]), n_present=F(lambda r: r["present"]),
+                      contig_length=F(lambda r: s.clen[r["contig"]]),
+                      c_start=F(lambda r: r["start"]), c_end=F(lambda r: r["end"]), strand=F(lambda r: "+" if r["strand"] > 0 else "-"),
+                      first_slot=F(lambda r: r["first"]), last_slot=F(lambda r: r["last"]), n_present=F(lambda r: r["present"]),
                       frac=F(lambda r: round(r["present"] / len(B[r["block"]][0]), 4)), complete=F(complete),
                       start_status=F(lambda r: r["start_status"]), end_status=F(lambda r: r["end_status"]),
                       n_flipped=F(lambda r: r["flipped"]), n_dup=F(lambda r: r["dup"]), insert_bp=F(lambda r: r["insert_bp"]),
-                      host_instance=F(lambda r: r["host"]), host_pos=F(lambda r: r["host_pos"]),
+                      host_instance=F(lambda r: r["host"]), host_slot=F(lambda r: r["host_pos"]),
+                      nb5_instance=F(lambda r: N5[r["id"]][0]), nb5_key=F(lambda r: N5[r["id"]][1]), nb5_gap=F(lambda r: N5[r["id"]][2]),
+                      nb5_mags=F(lambda r: N5[r["id"]][3]),
+                      nb3_instance=F(lambda r: N3[r["id"]][0]), nb3_key=F(lambda r: N3[r["id"]][1]), nb3_gap=F(lambda r: N3[r["id"]][2]),
+                      nb3_mags=F(lambda r: N3[r["id"]][3]),
+                      n_mag_copies=F(lambda r: copies[(r["block"], r["mag"])]), dup_in_mag=F(lambda r: r["id"] in dupin),
                       identity=F(lambda r: round(s.ident[r["id"]][0], 5) if r["id"] in s.ident else None),
                       aligned_frac=F(lambda r: round(s.ident[r["id"]][1], 4) if r["id"] in s.ident else None), is_rep=F(isrep)),
                  f"{out}/instances.parquet")
+        # lift: exact-match segments instance <-> polished block sequence
+        G_ = s.seg
+        write_pq(dict(MGS=[m] * len(G_), MAG=[s.mags[s.I[g[0]]["mag"]] for g in G_], instance=[g[0] for g in G_],
+                      block=[bid[s.I[g[0]]["block"]] for g in G_], contig=[g[1] for g in G_], c_start=[g[2] for g in G_],
+                      c_end=[g[3] for g in G_], b_start=[g[4] for g in G_], ori=[g[5] for g in G_]), f"{out}/lift.parquet")
         bs = []
         for bi in nb:
-            rs = s.by_block[bi]; ms = {r["mag"] for r in rs}; ids = [s.ident[r["id"]][0] for r in rs if r["id"] in s.ident]
-            r0, path = s.rep[bi], B[bi][0]
-            bs.append(dict(MGS=m, block=bid[bi], tier=tier(bi), n_genes=len(path), length=len(s.seqs[bi]), consensus_length=s.ce[bi][-1],
+            rs = s.by_block[bi]; ms = {r["mag"] for r in rs}; ids = [s.ident[r["id"]][0] for r in rs if r["id"] in s.ident and r is not s.rep[bi]]
+            r0, path, q = s.rep[bi], B[bi][0], s.pseq[bi]
+            g_, c_ = q.count("G"), q.count("C")
+            bs.append(dict(MGS=m, block=bid[bi], tier=tier(bi), n_genes=len(path), seq_genes=r0["present"], length=len(q),
+                           consensus_length=s.ce[bi][-1], gc=round((g_ + c_) / max(1, len(q)), 4),
+                           gc_skew=round((g_ - c_) / (g_ + c_), 4) if g_ + c_ else None, n_polished=s.npol.get(bi, 0), seq=q,
                            circular=B[bi][2], n_instances=len(rs), n_mags=len(ms), n_mags_complete=len({r["mag"] for r in rs if complete(r)}),
                            prevalence=round(len(ms) / s.nm, 4), prevalence_adj=round(len(ms) / s.tot_comp, 4),
                            n_samples=len({x for i in ms for x in s.smp[i].split(",") if x}),
                            median_identity=round(statistics.median(ids), 5) if ids else None,
                            shared_frac=round(sum(s.fam_shared.get(f, 1) > 1 for f, _ in path) / len(path), 4),
                            max_mgs=max(s.fam_shared.get(f, 1) for f, _ in path),
-                           rep_MAG=s.mags[r0["mag"]], rep_contig=r0["contig"], rep_start=r0["start"], rep_end=r0["end"],
+                           rep_MAG=s.mags[r0["mag"]], rep_contig=r0["contig"], rep_c_start=r0["start"], rep_c_end=r0["end"],
                            rep_strand="+" if r0["strand"] > 0 else "-", rep_complete=complete(r0),
                            rep_is_MGS_rep=s.MAG[s.mags[r0["mag"]]]["is_rep"] == "1"))
         cols = lambda rows, keys: {k: [r[k] for r in rows] for k in keys}
-        BK = ["MGS", "block", "tier", "n_genes", "length", "consensus_length", "circular", "n_instances", "n_mags", "n_mags_complete",
-              "prevalence", "prevalence_adj", "n_samples", "median_identity", "shared_frac", "max_mgs", "rep_MAG", "rep_contig",
-              "rep_start", "rep_end", "rep_strand", "rep_complete", "rep_is_MGS_rep"]
+        BK = ["MGS", "block", "tier", "n_genes", "seq_genes", "length", "consensus_length", "gc", "gc_skew", "n_polished", "circular",
+              "n_instances", "n_mags", "n_mags_complete", "prevalence", "prevalence_adj", "n_samples", "median_identity", "shared_frac",
+              "max_mgs", "rep_MAG", "rep_contig", "rep_c_start", "rep_c_end", "rep_strand", "rep_complete", "rep_is_MGS_rep", "seq"]
         write_pq(cols(bs, BK), f"{out}/blocks.parquet")
-        # block genes: consensus and representative coordinates (1-based, on the block's orientation)
+        # block genes: consensus layout coordinates (cons_*) and block-sequence coordinates (seq_* = the frame of block_pos)
         npos = collections.Counter((r["block"], p) for r in I for p in {p for _, p in r["genes"]})
         bg = []
         for bi in nb:
@@ -709,13 +875,13 @@ class MGS:
                 if g is None: rs_ = re_ = rgn = None
                 elif r0["strand"] > 0: rs_, re_, rgn = s.st[g] - r0["start"] + 1, s.en[g] - r0["start"] + 1, f"{s.ctg[g]}_{s.n[g]}"
                 else: rs_, re_, rgn = r0["end"] - s.en[g] + 1, r0["end"] - s.st[g] + 1, f"{s.ctg[g]}_{s.n[g]}"
-                bg.append(dict(MGS=m, block=bid[bi], pos=j, family=f, orientation="+" if o > 0 else "-",
-                               catalogue=",".join(map(str, sorted(s.fam_cats[f]))), n_instances=npos[(bi, j)], median_len=s.mlen[f],
-                               cons_start=s.cs[bi][j] + 1, cons_end=s.ce[bi][j], rep_gene=rgn, rep_start=rs_, rep_end=re_,
+                bg.append(dict(MGS=m, block=bid[bi], slot=j, family=f, orientation="+" if o > 0 else "-",
+                               catalogue=sorted(s.fam_cats[f]), n_instances=npos[(bi, j)], median_len=s.mlen[f],
+                               cons_start=s.cs[bi][j] + 1, cons_end=s.ce[bi][j], rep_gene=rgn, seq_start=rs_, seq_end=re_,
                                shared_mgs=s.fam_shared.get(f, 1)))
-        GK = ["MGS", "block", "pos", "family", "orientation", "catalogue", "n_instances", "median_len", "cons_start", "cons_end",
-              "rep_gene", "rep_start", "rep_end", "shared_mgs"]
-        write_pq(cols(bg, GK), f"{out}/block_genes.parquet")
+        GK = ["MGS", "block", "slot", "family", "orientation", "catalogue", "n_instances", "median_len", "cons_start", "cons_end",
+              "rep_gene", "seq_start", "seq_end", "shared_mgs"]
+        write_pq(cols(bg, GK), f"{out}/block_genes.parquet", dict(catalogue=pa.list_(pa.int64())))
         # every gene of every MAG: role, family, block position, instance -> fully traceable
         fam = s.fam
         def role(g):
@@ -726,31 +892,27 @@ class MGS:
             if f not in s.anchor: return "rare"
             return tier(s.bpos[f][0]) if f in s.bpos else "unblocked"
         G = range(s.N)
-        write_pq(dict(MAG=[s.mags[s.gm[g]] for g in G], contig=s.ctg, gene=[f"{c}_{n}" for c, n in zip(s.ctg, s.n)], start=s.st,
-                      end=s.en, strand=["+" if x > 0 else "-" for x in s.sd], partial=s.partial, catalogue=s.cat, family=fam,
+        write_pq(dict(MGS=[m] * s.N, MAG=[s.mags[s.gm[g]] for g in G], contig=s.ctg, gene=[f"{c}_{n}" for c, n in zip(s.ctg, s.n)],
+                      c_start=s.st, c_end=s.en, strand=["+" if x > 0 else "-" for x in s.sd], partial=s.partial, catalogue=s.cat, family=fam,
                       role=[role(g) for g in G], block=[bid[s.bpos[fam[g]][0]] if g in s.g_pos else None for g in G],
-                      pos=[s.g_pos.get(g) for g in G],
+                      slot=[s.g_pos.get(g) for g in G],
                       instance=[s.g_inst.get(g) for g in G], slot_after=[s.g_slot.get(g) for g in G]),
                  f"{out}/genes.parquet", dict(catalogue=pa.int64()))
         Fm = sorted(s.pres)
         cls = lambda f: ("linker" if f in s.linker else "hub" if f in s.hub else "partial_only" if not s.nmag[f] else
                          "rare" if f not in s.anchor else "core_anchor" if f in s.core_anchor else "anchor")
-        write_pq(dict(MGS=[m] * len(Fm), family=Fm, catalogue=[",".join(map(str, sorted(s.fam_cats[f]))) for f in Fm],
+        write_pq(dict(MGS=[m] * len(Fm), family=Fm, catalogue=[sorted(s.fam_cats[f]) for f in Fm],
                       n_catalogue=[len(s.fam_cats[f]) for f in Fm], n_mags=[s.nmag[f] for f in Fm],
                       prevalence_adj=[round(s.padj[f], 4) for f in Fm], max_copies=[s.maxc[f] for f in Fm],
                       multi_copy_mags=[s.multi[f] for f in Fm], median_len=[s.mlen.get(f) for f in Fm],
                       cls=[cls(f) for f in Fm], block=[bid[s.bpos[f][0]] if f in s.bpos else None for f in Fm],
-                      pos=[s.bpos[f][1] if f in s.bpos else None for f in Fm], shared_mgs=[s.fam_shared.get(f, 1) for f in Fm]),
-                 f"{out}/families.parquet")
-        A = sorted(s.aln)
-        write_pq(dict(instance=[x[0] for x in A], block=[bid[s.I[x[0]]["block"]] for x in A], q_start=[x[1] for x in A],
-                      q_end=[x[2] for x in A], strand=[x[3] for x in A], b_start=[x[4] for x in A], b_end=[x[5] for x in A],
-                      matches=[x[6] for x in A], aln_len=[x[7] for x in A], cigar=[x[8] for x in A]), f"{out}/alignments.parquet")
+                      slot=[s.bpos[f][1] if f in s.bpos else None for f in Fm], shared_mgs=[s.fam_shared.get(f, 1) for f in Fm]),
+                 f"{out}/families.parquet", dict(catalogue=pa.list_(pa.int64())))
         write_pq(dict(cat_a=[x for x, _, _ in s.merges], cat_b=[y for _, y, _ in s.merges], identity=[z for _, _, z in s.merges]),
                  f"{out}/merged_catalogue_genes.parquet")
         Lk = sorted(s.links.items(), key=lambda kv: (-len(kv[1][0]), kv[0]))
-        write_pq(dict(MGS=[m] * len(Lk), block_a=[bid[k[0][0]] for k, _ in Lk], pos_a=[k[0][1] for k, _ in Lk], end_a=[k[0][2] for k, _ in Lk],
-                      block_b=[bid[k[1][0]] for k, _ in Lk], pos_b=[k[1][1] for k, _ in Lk], end_b=[k[1][2] for k, _ in Lk],
+        write_pq(dict(MGS=[m] * len(Lk), block_a=[bid[k[0][0]] for k, _ in Lk], slot_a=[k[0][1] for k, _ in Lk], end_a=[k[0][2] for k, _ in Lk],
+                      block_b=[bid[k[1][0]] for k, _ in Lk], slot_b=[k[1][1] for k, _ in Lk], end_b=[k[1][2] for k, _ in Lk],
                       terminal=[v[2] for _, v in Lk], n_mags=[len(v[0]) for _, v in Lk], median_gap=[statistics.median_low(v[1]) for _, v in Lk],
                       MAGs=[",".join(sorted(s.mags[i] for i in v[0])) for _, v in Lk]),
                  f"{out}/links.parquet")
@@ -788,17 +950,51 @@ class MGS:
                 acc += x
                 if acc >= fr * sum(content): return i + 1
             return 0
-        ids, tbp = [v[0] for v in s.ident.values()], max(1, sum(s.mbp.values()))
+        ids = [v[0] for i, v in s.ident.items() if s.I[i] is not s.rep[s.I[i]["block"]]]
+        tbp = max(1, sum(s.mbp.values()))
+        s.composition(out)                                   # + contig_seqs.parquet
         summ = dict(MGS=m, status="done" if B else "no_blocks", n_mags=s.nm, n_contigs=len(s.contigs), bp=sum(s.mbp.values()), n_genes=s.N,
                     n_masked=sum(s.masked), n_mixed=len(s.mixed), n_families=len(s.pres), n_merged=len(s.merges), n_linker=len(s.linker), n_hub=len(s.hub),
                     n_rare=sum(1 for f in s.pres if cls(f) == "rare"), n_core_anchor=len(s.core_anchor),
                     n_blocks_core=sum(b[3] == "core" for b in B), n_blocks_accessory=sum(b[3] != "core" for b in B),
-                    bp_blocks=sum(map(len, s.seqs.values())), frac_bp_core=round(sum(v[0] for v in s.mcov.values()) / tbp, 4),
+                    bp_blocks=sum(map(len, s.seqs.values())), n_polished=sum(s.npol.values()),
+                    frac_genes_in_seq=round(sum(s.rep[bi]["present"] for bi in nb) / max(1, sum(len(B[bi][0]) for bi in nb)), 4),
+                    n_lift=len(s.seg), frac_bp_core=round(sum(v[0] for v in s.mcov.values()) / tbp, 4),
                     frac_bp_blocks=round(sum(v[1] for v in s.mcov.values()) / tbp, 4), blocks_for_50pct=n_for(0.5), blocks_for_90pct=n_for(0.9),
                     n_instances=len(I), median_identity=round(statistics.median(ids), 5) if ids else "", n_links=len(s.links),
                     edge_min=s.edge_min, family_min=s.fam_min, settings=s.a.settings_txt, mmt=s.a.mmt_version)
         write_text(f"{out}/summary.tsv", "\t".join(summ) + "\n" + "\t".join(map(str, summ.values())) + "\n")
         return summ
+
+    def composition(s, out):
+        """base counts of every MAG contig (contig + strand) in 1 kb windows: GC skew, cumulative skew (replichores,
+        ori / ter) and composition context of any position can be derived from it ; contig_seqs.parquet: the sequence of
+        every MAG contig (upper case, as in the assembly), written in batches (an MGS may hold Gb of contigs)"""
+        import numpy as np, pyarrow as pa
+        rows = collections.defaultdict(list)
+        sch = pa.schema([(c, pq_type(c)) for c in ("MGS", "MAG", "contig", "length", "seq")])
+        tmp = f"{out}/contig_seqs.parquet.{os.getpid()}.tmp"
+        w, buf, nb = pq_writer(tmp, sch), collections.defaultdict(list), 0
+        def flush():
+            if buf["contig"]: w.write_table(pa.table({f.name: pa.array(buf[f.name], f.type) for f in sch}))
+            buf.clear()
+        for c in sorted(s.clen, key=lambda c: (s.cmag[c], c)):
+            k = s.asm[s.MAG[s.mags[s.cmag[c]]]["assembly"]]
+            if k["key"] not in s.fa: s.fa[k["key"]] = fasta_open(k["fasta"], k["fai"], k["gzi"])
+            sq = s.fa[k["key"]].fetch(c).upper()
+            for f, v in (("MGS", s.m), ("MAG", s.mags[s.cmag[c]]), ("contig", c), ("length", len(sq)), ("seq", sq)): buf[f].append(v)
+            nb += len(sq)
+            if nb >= 32 << 20: flush(); nb = 0
+            q = np.frombuffer(sq.encode(), np.uint8)
+            L, W = len(q), 1000
+            n = (L + W - 1) // W
+            x = np.zeros(n * W, np.uint8); x[:L] = q; x = x.reshape(n, W)
+            st = np.arange(n) * W + 1
+            rows["MGS"] += [s.m] * n; rows["MAG"] += [s.mags[s.cmag[c]]] * n; rows["contig"] += [c] * n
+            rows["w_start"] += st.tolist(); rows["w_end"] += np.minimum(st + W - 1, L).tolist()
+            for b, col in ((65, "a"), (67, "c"), (71, "g"), (84, "t")): rows[col] += (x == b).sum(1).tolist()
+        flush(); w.close(); os.replace(tmp, f"{out}/contig_seqs.parquet")
+        write_pq({k: rows[k] for k in ("MGS", "MAG", "contig", "w_start", "w_end", "a", "c", "g", "t")}, f"{out}/composition.parquet")
 
 
 def same_prep(a):
@@ -810,18 +1006,19 @@ def same_prep(a):
 def cmd_mgs(a):
     same_prep(a)
     x = MGS(a)
-    out = f"{a.out}/.MGS={a.mgs}.{os.getpid()}.tmp"; shutil.rmtree(out, ignore_errors=True); os.makedirs(out)
+    out = f"{a.out}/.{a.mgs}.{os.getpid()}.tmp"; shutil.rmtree(out, ignore_errors=True); os.makedirs(out)
     try:
-        x.families(); x.classes(); x.blocks(); x.instances(); x.representatives(); x.identity()
+        x.families(); x.classes(); x.blocks(); x.instances(); x.representatives(); x.lift()
         summ = x.write(out)
         for f in x.fa.values(): f.close()
         write_text(f"{out}/.fp", a.fp + "\n")
         same_prep(a)
     except BaseException:
         shutil.rmtree(out, ignore_errors=True); raise
-    final = f"{a.out}/MGS={a.mgs}"
-    if os.path.isdir(final): shutil.rmtree(final)
+    final, old = f"{a.out}/{a.mgs}", f"{a.out}/.{a.mgs}.{os.getpid()}.old"
+    if os.path.isdir(final): os.replace(final, old)     # swap by renames: readers never see a half-deleted folder
     os.replace(out, final)
+    shutil.rmtree(old, ignore_errors=True)
     log(f"{a.mgs}: {summ['n_mags']} MAGs, {summ['n_families']} families ({summ['n_merged']} merged, {summ['n_linker']} linker, "
         f"{summ['n_hub']} hub) -> {summ['n_blocks_core']} core + {summ['n_blocks_accessory']} accessory blocks, {summ['n_instances']} "
         f"instances ; blocks cover {summ['frac_bp_blocks']:.3f} of the MAG bp (core {summ['frac_bp_core']:.3f})")
@@ -831,10 +1028,12 @@ def cmd_summary(a):
     rows, head = [], None
     for d in sorted(os.listdir(a.out)):
         f = f"{a.out}/{d}/summary.tsv"
-        if d.startswith("MGS=") and os.path.isfile(f):
+        if not d.startswith((".", "_")) and os.path.isfile(f"{a.out}/{d}/.fp") and os.path.isfile(f):
             h, v = open(f).read().rstrip("\n").split("\n")[:2]
-            head = head or h; rows.append(v)
-    write_text(f"{a.out}/summary.tsv", f"{head}\n" + "".join(r + "\n" for r in rows) if head else "")
+            rows.append(dict(zip(h.split("\t"), v.split("\t"))))
+    head = list(dict.fromkeys(k for r in rows for k in r))      # MGS done by different MMT versions: union of columns
+    write_text(f"{a.out}/summary.tsv", "\t".join(head) + "\n" + "".join("\t".join(r.get(k, "") for k in head) + "\n" for r in rows)
+               if rows else "")
     print(len(rows))
 
 
@@ -851,6 +1050,7 @@ def main():
     p.add_argument("--threads", type=int, default=1); p.add_argument("--minimap2", default="")
     p.add_argument("--settings", required=True); p.add_argument("--settings-txt", default=""); p.add_argument("--fp", default="")
     p.add_argument("--mmt-version", default=""); p.add_argument("--prep-fp", default="")
+    p.add_argument("--keep-tmp", action="store_true", help="keep the instance-alignment work folder (mmt --debug)")
     p = sp.add_parser("summary"); p.add_argument("--out", required=True)
     a = ap.parse_args()
     {"prep": cmd_prep, "plan": cmd_plan, "mgs": cmd_mgs, "summary": cmd_summary}[a.cmd](a)

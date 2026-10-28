@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # standins.sh BINDIR PYTHON [IPDSUMMARY [MODEL]] - SMRT Link stand-ins for testing MMT where SMRT Link is not installed.
 #   ccs-kinetics-bystrandify  python (pysam): one pseudo-read per strand, ip = fi / ri
-#   pbmm2                     index = copy of the FASTA ; align = minimap2 map-hifi + identity filter, tags kept
+#   pbmm2                     index = copy of the FASTA ; align = minimap2 map-hifi + gap-compressed identity filter, tags kept
 #   pbindex                   no-op
 #   ipdSummary                a kineticsTools ipdSummary (pip) with an explicit model, when given
 #   Needs samtools + minimap2 on PATH. Never used on the HPC: there MMT_SMRT_BIN points at the real SMRT Link.
@@ -36,9 +36,9 @@ h['HD'] = src['HD']; h['RG'] = src['RG']
 o = pysam.AlignmentFile('\$OUT', 'wb', header=h); y = float('\$Y') / 100
 for r in f:
     if r.is_unmapped: continue
-    c = {}
-    for op, l in r.cigartuples: c[op] = c.get(op, 0) + l
-    m = c.get(7, 0); d = m + c.get(8, 0) + c.get(1, 0) + c.get(2, 0)
+    c, g = {}, 0                       # pbmm2 -y = gap-compressed identity: an indel of any length is one difference
+    for op, l in r.cigartuples: c[op] = c.get(op, 0) + l; g += op in (1, 2)
+    m = c.get(7, 0); d = m + c.get(8, 0) + g
     if d and m / d >= y: o.write(pysam.AlignedSegment.from_dict(r.to_dict(), o.header))
 o.close()"
 EOF
