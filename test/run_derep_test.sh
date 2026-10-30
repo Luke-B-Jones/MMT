@@ -9,10 +9,11 @@ W=$(readlink -m "$1"); HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")"
 PY=$(command -v "${MMT_TEST_PY:-python3}") || { echo "no python"; exit 2; }
 rm -rf "$W"; mkdir -p "$W"
 NP=0 NF=0
+IDXD="$W/tmp/mmt/out_$(printf '%s' "$W/out" | md5sum | cut -c1-8)/index"   # the index cache of OUT (MMT work_root)
 t() { if eval "$2"; then echo "PASS  $1"; NP=$((NP + 1)); else echo "FAIL  $1"; NF=$((NF + 1)); fi; }
 OUT="$W/out"; D="$OUT/derep-ctg"
 run() {   # run ARGS... -> RC, TERM_TXT (terminal output)
-    "$MMT" derep-ctg "$@" --config "$W/test.conf" > "$W/term.txt" 2>&1; RC=$?
+    "$MMT" derep-ctg "$@" --config "$W/test.conf" -l "$W/logs" > "$W/term.txt" 2>&1; RC=$?
     TERM_TXT=$(cat "$W/term.txt")
     echo "    \$ mmt derep-ctg $*  -> exit $RC, $(grep -c . "$W/term.txt") terminal line(s)"
 }
@@ -44,7 +45,8 @@ MMT_MEM_GB=4
 EOF
 conf ''
 GC="$W/mock/gc"; CIDX="$GC/compl.incompl.95.fna.clstr.idx"; MVG="$GC/Bin_SB/MAGvsGC.txt.gz"; MAP="$W/mock/map.txt"
-asm_of() { awk -F'\t' -v s="$1" '$1 == s {print $5}' "$OUT/index/samples.tsv"; }   # assembly folder of a sample
+asm_of() { awk -F'\t' -v s="$1" '$1 == s {print $5}' "$IDXD/samples.tsv"; }   # assembly folder of a sample
+ML() { cat "$OUT"/mmt_*.log; }
 
 echo "== help and option errors"
 "$MMT" help dereplicate-contigs > "$W/h.txt" 2>&1
@@ -97,10 +99,10 @@ t "two parts: both exit 0, all 3 MGS done, no lock / temp left" \
 t "parts are balanced: MGS.0 (20 MAGs) alone in part 1" 'grep -q "plan: 1 MGS to do" "$W/p1.txt" && grep -q "plan: 2 MGS to do" "$W/p2.txt"'
 run -o "$OUT"
 t "rerun: nothing to do, summary of all 3 MGS" '[[ $RC == 0 && $TERM_TXT == *"plan: 0 MGS to do, 3 up to date"* && $(grep -c . "$D/summary.tsv") == 4 ]]'
-t "README.md and mmt.log written (START, MGS done, END)" '[[ -s $D/README.md && -s $OUT/README.md ]] && grep -q "derep-ctg  MGS  MGS.0 done: 20 MAGs" "$OUT/mmt.log" && grep -q "derep-ctg  END  " "$OUT/mmt.log" && [[ $(grep -c "derep-ctg  START" "$OUT/mmt.log") == $(( $(grep -c "derep-ctg  END" "$OUT/mmt.log") + $(grep -c "derep-ctg  STOP" "$OUT/mmt.log") )) ]]'
+t "no README in OUT ; mmt log written (START, MGS done, END)" '[[ ! -e $D/README.md && ! -e $OUT/README.md ]] && ML | grep -q "derep-ctg  MGS  MGS.0 done: 20 MAGs" && ML | grep -q "derep-ctg  END  " && [[ $(ML | grep -c "derep-ctg  START") == $(( $(ML | grep -c "derep-ctg  END") + $(ML | grep -c "derep-ctg  STOP") )) ]]'
 
 echo "== results against the truth"
-"$PY" "$HERE/check_derep.py" "$W/mock" "$D" > "$W/truth.txt"; rc=$?
+MMT_TEST_IDX="$IDXD" "$PY" "$HERE/check_derep.py" "$W/mock" "$D" > "$W/truth.txt"; rc=$?
 grep -E "^(FAIL|all|[0-9]+ FAILED)" "$W/truth.txt" | sed 's/^/    /'
 t "truth: $(grep -c ^PASS "$W/truth.txt") checks pass" '[[ $rc == 0 ]]'
 
@@ -141,7 +143,7 @@ sleep 25 & SP=$!
 mkdir "$D/.lock.MGS.2"; echo "$(hostname) $SP none" > "$D/.lock.MGS.2/owner"
 s0=$(date +%s); run -o "$OUT" --mgs MGS.2 --force
 t "MGS locked by a live job: waits for it, then takes the lock over" \
-  '[[ $RC == 0 && $(( $(date +%s) - s0 )) -ge 15 ]] && grep -q "another job is working on it" "$OUT"/logs/derep-ctg/*.log'
+  '[[ $RC == 0 && $(( $(date +%s) - s0 )) -ge 15 ]] && grep -q "another job is working on it" "$W"/logs/derep-ctg/*.log'
 wait "$SP" 2> /dev/null
 sleep 0 & DP=$!; wait "$DP"
 mkdir "$D/.lock.MGS.2"; echo "$(hostname) $DP none" > "$D/.lock.MGS.2/owner"
@@ -178,7 +180,7 @@ run -o "$OUT"
 t "catalogue proteins that do not belong to the genes: prep stops and says so" '[[ $RC == 1 && $TERM_TXT == *"do not resemble the protein of their catalogue gene"* ]]'
 cp "$W/prot.bak" "$PROT"
 GFF=$(ls "$A"/genePred/genes.gff*); cp "$GFF" "$W/gff.bak"
-"$PY" - "$GFF" "$OUT/index/contigs.tsv.gz" << 'EOF'
+"$PY" - "$GFF" "$IDXD/contigs.tsv.gz" << 'EOF'
 import gzip, sys
 f, idx = sys.argv[1:3]
 op = (lambda p, m: gzip.open(p, m + "t")) if f.endswith(".gz") else open
@@ -189,7 +191,7 @@ EOF
 cp -r "$D/_prep" "$W/prep.before"
 run -o "$OUT"
 t "GFF lost a catalogue gene: prep fails with a clear message, old prep kept, no lock" \
-  '[[ $RC == 1 && $TERM_TXT == *"prep failed"* && ! -e $D/.prep.lock && ! -e $D/.prep.build ]] && grep -q "catalogue member genes not in" "$OUT"/logs/derep-ctg/*.log && diff -rq "$D/_prep" "$W/prep.before" > /dev/null'
+  '[[ $RC == 1 && $TERM_TXT == *"prep failed"* && ! -e $D/.prep.lock && ! -e $D/.prep.build ]] && grep -q "catalogue member genes not in" "$W"/logs/derep-ctg/*.log && diff -rq "$D/_prep" "$W/prep.before" > /dev/null'
 cp "$W/gff.bak" "$GFF"
 run -o "$OUT"
 t "GFF restored: runs again" '[[ $RC == 0 ]]'
@@ -223,13 +225,13 @@ cp "$W/map.bak" "$MAP"; cp "$W/mvg.bak" "$MVG"; cp "$W/bin.bak" "$BF"
 echo "== a MAG of three co-binned strains: P14 + the MGS.0 contigs of P12 and P13"
 "$PY" "$HERE/derep_mock.py" --mix "$W/mock" P14 P12 P13 || echo "mix failed"
 run -o "$OUT"
-"$PY" "$HERE/check_derep.py" "$W/mock" "$D" > "$W/truth2.txt"; rc=$?
+MMT_TEST_IDX="$IDXD" "$PY" "$HERE/check_derep.py" "$W/mock" "$D" > "$W/truth2.txt"; rc=$?
 grep -E "^FAIL" "$W/truth2.txt" | sed 's/^/    /'
 t "mixed MAG: flagged, its copies make no linker, every truth check still passes" \
   '[[ $RC == 0 && $rc == 0 ]] && "$PY" -c "import pandas as pd; m = pd.read_parquet(\"$D/MGS.0/mags.parquet\"); assert m.set_index(\"MAG\").mixed.to_dict() == {g: g == \"P14__SemiBin_1\" for g in m.MAG}"'
 
 echo "== a results folder of MMT <= 0.2 (OUT/dereplicate-contigs, MGS=<MGS> folders) is moved, its prep reused"
-O4="$W/out4"; mkdir -p "$O4"; cp -r "$OUT/index" "$O4/"; cp -r "$D" "$O4/dereplicate-contigs"
+O4="$W/out4"; mkdir -p "$O4"; cp -r "$D" "$O4/dereplicate-contigs"
 for d in "$O4"/dereplicate-contigs/MGS.*; do mv "$d" "$O4/dereplicate-contigs/MGS=${d##*/}"; done
 "$MMT" derep-ctg -o "$O4" --config "$W/test.conf" > "$W/term.txt" 2>&1; RC=$?; TERM_TXT=$(cat "$W/term.txt")
 t "old folder moved, prep reused, MGS redone in the new layout, no MGS= folder left" \

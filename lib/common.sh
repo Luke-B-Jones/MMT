@@ -5,14 +5,17 @@
 # ============================================================================ messages + run log
 # Until start_log everything goes to the terminal. After it, stdout and stderr go to the run log, and only say / die
 # also reach the terminal (saved as fd 3 / fd 4) - an sbatch .out/.err file stays a few lines long.
+# The run log is kept only with -l/--log DIR (DIR/<analysis>/<name>.log, appended) ; without it it is a private file in
+# the work space, removed when the run ends - after a failure its last lines are printed to the terminal first.
 MMT_LOGGING=0
 MMT_QUIET=0       # 1 = say writes to the log only (commands whose terminal output is data, e.g. --list-samples)
 MMT_LOG=""
+RUN_ENDED=0       # 1 once a run has written its END line (the EXIT trap then adds no STOP line)
 log() { echo "[$(date '+%F %T')] $*"; }
 say() { log "$*"; if (( MMT_LOGGING && ! MMT_QUIET )); then echo "$*" >&3; fi; }
 die() {
     log "ERROR: $*" >&2
-    if (( MMT_LOGGING )); then echo "ERROR: $* (log: $MMT_LOG)" >&4; fi
+    if (( MMT_LOGGING )); then echo "ERROR: $*${MMT_LOG_DIR:+ (log: $MMT_LOG)}" >&4; fi
     exit 1
 }
 usage_die() {
@@ -20,36 +23,51 @@ usage_die() {
     if (( MMT_LOGGING )); then echo "mmt ${MMT_CMD:-}: $*  (see: mmt help ${MMT_CMD:-})" >&4; fi
     exit 2
 }
-start_log() {
-    MMT_LOG=$1
-    mkdir -p "$(dirname "$MMT_LOG")"
+start_log() {   # start_log ANALYSIS NAME : run log = <-l DIR>/ANALYSIS/NAME.log, else a private file under the work space
+    if [[ -n ${MMT_LOG_DIR:-} ]]; then
+        MMT_LOG="$(abspath "$MMT_LOG_DIR")/$1/$2.log"
+    else
+        MMT_LOG="$TMPROOT/logs/$1.$2.$(hostname -s).$$.log"
+    fi
+    mkdir -p "$(dirname "$MMT_LOG")" || usage_die "cannot create the log folder $(dirname "$MMT_LOG")"
     exec 3>&1 4>&2 >> "$MMT_LOG" 2>&1
     MMT_LOGGING=1
+    log "======== mmt $MMT_CMD - MMT $(mmt_version) on $(hostname -s), job ${JOBTAG:-?}"
 }
+end_log() {   # end_log RC : without -l the run log is removed (after a failure its last lines go to the terminal first)
+    (( MMT_LOGGING )) || return 0
+    [[ -n ${MMT_LOG_DIR:-} ]] && return 0
+    if (( $1 != 0 )); then { echo "---- last lines of the run log (keep whole logs with -l DIR):"; tail -n 25 "$MMT_LOG"; } >&4; fi
+    if (( ${MMT_DEBUG:-0} )); then echo "run log kept (--debug): $MMT_LOG" >&4; else rm -f "$MMT_LOG"; fi
+}
+log_ref() { if [[ -n ${MMT_LOG_DIR:-} ]]; then printf '%s' "$MMT_LOG"; else printf 'no run log kept (run with -l DIR)'; fi; }
 
-# ============================================================================ OUT/mmt.log (the output folder's own log)
-# One human-readable log per output folder, appended by every run of every command: its start and end, its plan per MGS
-# and what happened to every sample x MGS. Each line stands alone: "<date> <time>  <command>  <EVENT>  <text>", so
-# `grep MGS.12 OUT/mmt.log` or `grep PDB15 OUT/mmt.log` gives the history of an MGS or a sample. Detail (every step,
-# tool versions, timings) stays in the run's own log under OUT/logs/.
+# ============================================================================ OUT/mmt_<date>.log (the output folder's own log)
+# One human-readable log per output folder and date, appended by every run of every command: its start and end, its
+# plan per MGS and what happened to every sample x MGS. Each line stands alone: "<date> <time>  <command>  <EVENT>  <text>",
+# so `grep MGS.12 OUT/mmt_*.log` or `grep PDB15 OUT/mmt_*.log` gives the history of an MGS or a sample. The date in the
+# name is today's, or MMT_LOG_DATE when set (a pipeline sets it once, so every job of one run writes to one file).
+# Detail (every step, tool versions, timings) is in the run logs (-l DIR).
 MLOG_CMD=""       # e.g. "MGScall --mgs-rep" - set by the command
 MLOG_ON=0         # set by the command once OUT is known (dry runs leave it off)
-mlog() {   # mlog EVENT LINE [LINE...] : append to OUT/mmt.log under a lock (appends from several nodes to one NFS file
-           # are not atomic) ; the lock is held for one write: one left by a killed writer is broken after ~60 s
+MLOG_FILE=""
+mlog() {   # mlog EVENT LINE [LINE...] : append to OUT/mmt_<date>.log under a lock (appends from several nodes to one NFS
+           # file are not atomic) ; the lock is held for one write: one left by a killed writer is broken after ~60 s
     (( MLOG_ON )) || return 0
     local l="$MMT_OUT/.mmt.log.lock" i=0 ev=$1 h x; shift
+    MLOG_FILE=${MLOG_FILE:-$MMT_OUT/mmt_${MMT_LOG_DATE:-$(date +%F)}.log}
     h="$(date '+%F %T')  $MLOG_CMD  $ev"
     until mkdir "$l" 2> /dev/null; do
         i=$(( i + 1 ))
         if (( i > 240 )); then rm -rf "$l"; i=0; fi
         sleep 0.25
     done
-    for x in "$@"; do printf '%s  %s\n' "$h" "$x"; done >> "$MMT_OUT/mmt.log"
+    for x in "$@"; do printf '%s  %s\n' "$h" "$x"; done >> "$MLOG_FILE"
     rmdir "$l" 2> /dev/null || true
 }
-mlog_start() {   # mlog_start "MGScall --mgs-rep" ARGS... : START line (job, host, version, arguments, run log)
+mlog_start() {   # mlog_start "mgs-rep" ARGS... : START line (job, host, version, arguments, run log)
     MLOG_CMD=$1; MLOG_ON=1; shift
-    mlog START "job ${JOBTAG:-?} on $(hostname -s) | MMT $(mmt_version) | ${*:-(no selection: all)} | run log ${MMT_LOG#"$MMT_OUT"/}"
+    mlog START "job ${JOBTAG:-?} on $(hostname -s) | MMT $(mmt_version) | ${*:-(no selection: all)} | run log: $(log_ref)"
 }
 last_error() {   # the run log's last ERROR, short: a failed command is cut to its first 80 characters
     local e re="^(line [0-9]+: ')(.*)(' failed \(exit [0-9]+\))$"
@@ -66,32 +84,31 @@ job_tag() {   # JOBTAG = <array job>_<task> | <job> | local<pid>
     JOBTAG=${JOBTAG:-${SLURM_JOB_ID:-local$$}}
 }
 
-run_exit() {   # EXIT trap of a run: an early stop is written to OUT/mmt.log with its reason
+run_exit() {   # EXIT trap of a run: an early stop (no END line yet) is written to the mmt log with its reason ; run log
+               # removed unless -l
     local rc=$1 e
-    (( rc == 0 )) && return 0
-    e=$(last_error)
-    if (( rc == 143 )); then e="stopped by a signal (scancel / time limit)"; fi
-    mlog STOP "exit $rc: ${e:-see the run log} - details: ${MMT_LOG#"$MMT_OUT"/}"
+    if (( rc != 0 && ! RUN_ENDED )); then
+        e=$(last_error)
+        if (( rc == 143 )); then e="stopped by a signal (scancel / time limit)"; fi
+        mlog STOP "exit $rc: ${e:-see the run log} - $(log_ref)"
+    fi
+    end_log "$rc"
 }
 
-plan_log() {   # PLAN lines in OUT/mmt.log: per selected MGS where it is present and what is to do
-               # (needs MGS_SEL OKS UNITS P_TODO P_CUR todo_samples of the command's plan ; MODE mag-rep: other wording)
+plan_log() {   # PLAN lines in the mmt log: per selected MGS where it has a MAG, what is to do, and where GeneCat's abundance
+               # table has it without a MAG (needs MGS_SEL OKS UNITS P_TODO P_CUR todo_samples ; reads IDX/abundance.tsv)
     local m s n_in n_todo n_cur
-    local -a lines=() notin=() here=()
+    local -a lines=() nb=()
+    declare -A ab=()
+    while IFS=$'\t' read -r s m _; do ab[$s|$m]=1; done < <(tail -n +2 "$IDX/abundance.tsv")
     lines+=("selection: $(id_list "${MGS_SEL[@]}") ; usable samples ${#OKS[@]} ; samples with work ${#todo_samples[@]}")
     for m in "${MGS_SEL[@]}"; do
-        notin=(); here=()
+        n_in=0; nb=()
         for s in "${OKS[@]}"; do
-            if [[ " ${UNITS[$s]:-} " == *" $m "* ]]; then here+=("$s"); else notin+=("$s"); fi
+            if [[ " ${UNITS[$s]:-} " == *" $m "* ]]; then n_in=$(( n_in + 1 )); elif [[ -n ${ab[$s|$m]:-} ]]; then nb+=("$s"); fi
         done
-        n_in=${#here[@]}
         n_todo=$(wc -w <<< "${P_TODO[$m]:-}"); n_cur=$(wc -w <<< "${P_CUR[$m]:-}")
-        if [[ ${MODE:-} == mag-rep ]]; then
-            lines+=("$m: representative from the assembly of $(id_list "${here[@]}") -> to do $n_todo, up to date $n_cur")
-        else
-            lines+=("$m: a MAG in the assembly of $n_in of ${#OKS[@]} usable samples -> to do $n_todo, up to date $n_cur")
-            (( ${#notin[@]} == 0 )) || lines+=("$m: not planned (no MAG of it in the sample's assembly) $(id_list "${notin[@]}")")
-        fi
+        lines+=("$m: a MAG in the assembly of $n_in of ${#OKS[@]} usable samples -> to do $n_todo, up to date $n_cur ; present (GeneCat abundance) but not binned: $(id_list "${nb[@]}")")
     done
     mlog PLAN "${lines[@]}"
 }
@@ -143,7 +160,7 @@ common_opt() {
     COMMON_SHIFT=0
     case $1 in
         --debug|--keep-tmp) MMT_DEBUG=1; COMMON_SHIFT=1; return 0 ;;   # keep work folders (success or failure)
-        -i|--mf4-run|-o|--out|--tmp|-t|--threads|--mem|--genecat|--map|--config)
+        -i|--mf4-run|-o|--out|--tmp|-t|--threads|--mem|--genecat|--map|--config|-l|--log|--ipd-args)
             [[ $# -ge 2 && -n $2 ]] || usage_die "$1 needs a value" ;;
         *) return 1 ;;
     esac
@@ -155,6 +172,8 @@ common_opt() {
         --mem)        MMT_MEM_GB=$2 ;;
         --genecat)    MMT_GENECAT=$2 ;;
         --map)        MMT_MAP=$2 ;;
+        -l|--log)     MMT_LOG_DIR=$2 ;;
+        --ipd-args)   MMT_IPD_ARGS=$2 ;;
         --config)     : ;;   # already read by load_config
     esac
     COMMON_SHIFT=2
@@ -202,6 +221,7 @@ setup_tools() {   # PYTHON SAMTOOLS DUCKDB IPDSUMMARY BYSTRANDIFY PBMM2 PBINDEX,
     h=$("$SAMTOOLS" mpileup 2>&1 || true)
     [[ $h == *--reverse-del* ]] || die "samtools $SAMTOOLS has no 'mpileup --reverse-del' - needs >= 1.15"
     "$PYTHON" -c 'import pysam, pyarrow, numpy' 2> /dev/null || die "python $PYTHON cannot import pysam, pyarrow and numpy"
+    read -ra IPD_EXTRA <<< "${MMT_IPD_ARGS:-}"   # handed to ipdSummary as they are (e.g. --ipdModel FILE)
     # CRAM: never let htslib download a reference (compute nodes have no internet ; MMT reads CRAMs without one)
     export REF_PATH=/nonexistent/mmt REF_CACHE=/nonexistent/mmt
 }
@@ -283,34 +303,9 @@ lock_stale() {   # lock_stale DIR HOST PID JOB
 }
 lock_release() { rm -rf -- "$1"; }
 
-write_out_readme() {   # OUT/README.md: what each folder holds (refreshed by every command)
-    local t
-    t=$(tmpname "$MMT_OUT/README.md")
-    cat > "$t" << EOF
-# MMT results
-
-Written by MMT (MF4 Methylation Toolkit, https://github.com/Luke-B-Jones/MMT), last run with $(mmt_version).
-Inputs: MATAFILER4 run \`$MMT_MF4_RUN\`, GeneCat \`$MMT_GENECAT\` (Bin_$MMT_BINNER), map \`$MMT_MAP\`.
-
-| Folder | What |
-|---|---|
-| \`index/\` | the MATAFILER4 / GeneCat layout MMT uses: \`samples.tsv\`, \`mgs.tsv\`, \`mags.tsv\`, \`contigs.tsv.gz\`, \`rep_contigs.tsv.gz\`, \`movies.tsv\` (read groups / chemistry of every raw BAM = batch key), \`report.txt\`; \`reads/<S>.parquet\` = which read lies on which MAG / MGS (from the sample's CRAM); \`depth/<S>.parquet\` = read depth of every MGS-MAG contig in 1 kb bins |
-| \`MGScall/\` | per-MGS methylation on the representative MAG: \`mgs-rep/\` and \`mag-rep/\`, \`<MGS>/<sample>.parquet\` - see \`MGScall/README.md\` |
-| \`derep-ctg/\` | per MGS: dereplicated contigs (gene blocks), every occurrence in every MAG, base-level positions (\`lift.parquet\`), genes, contig sequences - see \`derep-ctg/README.md\` |
-| \`ctg-meth/\` | per MGS x sample: methylation of every MAG's own contigs, lifted onto the blocks, plus junction (conformation) read sets - see \`ctg-meth/README.md\` |
-| \`mmt.log\` | **the log of this folder**: every run of every command (start, plan per MGS, what happened to every sample x MGS, end, failures with their reason) and \`mmt status\` summaries - one line per event, newest last; \`grep MGS.12 mmt.log\` = history of an MGS |
-| \`logs/\` | detail: one log per run and command (every step, tools, timings); \`ipdSummary/\` logs per sample |
-
-Every folder is updated in place by later runs: finished results are kept, missing ones added, results whose inputs or
-settings changed are redone. Folder and file names are plain (\`MGS.345/S1.parquet\`); MGS and sample are columns
-inside every result file, so \`read_parquet('OUT/ctg-meth/MGS.345/*.parquet')\` reads all samples of an MGS.
-EOF
-    publish "$t" "$MMT_OUT/README.md"
-}
-
 # ============================================================================ MF4 index (shared by all modules)
-INDEX_METHOD=3   # bump when lib/mf4.py index output changes -> every OUT rebuilds its index on the next run
-INDEX_FILES="samples.tsv mgs.tsv mags.tsv units.tsv assemblies.tsv contigs.tsv.gz rep_contigs.tsv.gz movies.tsv inputs.tsv report.txt"
+INDEX_METHOD=4   # bump when lib/mf4.py index output changes -> every OUT rebuilds its index on the next run
+INDEX_FILES="samples.tsv mgs.tsv mags.tsv units.tsv assemblies.tsv contigs.tsv.gz rep_contigs.tsv.gz movies.tsv abundance.tsv inputs.tsv report.txt"
 resolve_inputs() {   # absolute MMT_MAP, MMT_MF4_RUN (from the map when not given), MMT_GENECAT, MVG (MAGvsGC)
     local out rid
     [[ -n ${MMT_MAP:-} ]] || usage_die "no MATAFILER4 map: --map FILE or MMT_MAP in config/site.conf"
@@ -328,17 +323,21 @@ resolve_inputs() {   # absolute MMT_MAP, MMT_MF4_RUN (from the map when not give
     MMT_GENECAT=$(abspath "$MMT_GENECAT")
     MVG="$MMT_GENECAT/Bin_$MMT_BINNER/MAGvsGC.txt.gz"
     [[ -s $MVG ]] || die "GeneCat MGS table not found: $MVG (GeneCat MGS stage finished? MMT_BINNER=$MMT_BINNER?)"
+    ABUND="$MMT_GENECAT/Bin_$MMT_BINNER/Annotation/Abundance/MGS.matL0.txt"   # GeneCat's MGS abundance (presence)
 }
-resolve_out() {   # absolute MMT_OUT (created)
+resolve_out() {   # absolute MMT_OUT (created) ; TMPROOT = <tmp>/mmt ; WROOT = this OUT's work space there
     [[ -n ${MMT_OUT:-} ]] || usage_die "no output folder: -o DIR"
     mkdir -p "$MMT_OUT" || die "cannot create output folder $MMT_OUT"
     MMT_OUT=$(abspath "$MMT_OUT")
+    TMPROOT=$(abspath "${MMT_TMP:-${TMPDIR:-/tmp}}")/mmt
+    mkdir -p "$TMPROOT" || die "cannot create work space $TMPROOT"
+    work_root
 }
 
-# ensure_index : OUT/index/ describes these inputs (tables rebuilt when the map, MAGvsGC or settings changed):
-#   $INDEX_FILES + index.fp. Results do not depend on index.fp itself but on the checksums in units.tsv /
-#   assemblies.tsv, so an edit of the map that changes nothing for a sample redoes nothing.
-#   Several jobs may start at once: one builds (lock), the others wait for it.
+# ensure_index : <work space>/index/ (a cache: rebuilt whenever missing) describes these inputs - tables rebuilt when the
+#   map, MAGvsGC, GeneCat's abundance table or settings changed: $INDEX_FILES + index.fp. Results do not depend on
+#   index.fp itself but on the checksums in units.tsv / assemblies.tsv, so an edit of the map that changes nothing for a
+#   sample redoes nothing. Several jobs may start at once: one builds (lock), the others wait for it.
 index_current() {   # the index in IDX was built from these inputs and is complete
     local f
     [[ $(cat "$IDX/index.fp" 2> /dev/null) == "$INDEX_FP" ]] || return 1
@@ -348,8 +347,8 @@ index_current() {   # the index in IDX was built from these inputs and is comple
 }
 ensure_index() {
     local w=0
-    IDX="$MMT_OUT/index"
-    INDEX_FP=$(md5str "$INDEX_METHOD|$MMT_MF4_RUN|$MMT_GENECAT|$MMT_BINNER|$MMT_MAP|$(stamp "$MMT_MAP")|$(stamp "$MVG")")
+    IDX="$WROOT/index"
+    INDEX_FP=$(md5str "$INDEX_METHOD|$MMT_MF4_RUN|$MMT_GENECAT|$MMT_BINNER|$MMT_MAP|$(stamp "$MMT_MAP")|$(stamp "$MVG")|$(stamp "$ABUND")")
     index_current && return 0
     mkdir -p "$IDX"
     until lock_take "$IDX/.lock"; do
@@ -362,7 +361,7 @@ ensure_index() {
     log "index: building from $MMT_MF4_RUN + $MMT_GENECAT (Bin_$MMT_BINNER) + $MMT_MAP"
     rm -rf "$IDX/.build"; mkdir -p "$IDX/.build"
     if ! "$PYTHON" "$MMT_HOME/lib/mf4.py" index --mf4-run "$MMT_MF4_RUN" --genecat "$MMT_GENECAT" --map "$MMT_MAP" \
-            --binner "$MMT_BINNER" --out "$IDX/.build"; then
+            --binner "$MMT_BINNER" --abundance "$ABUND" --out "$IDX/.build"; then
         [[ -f $IDX/.build/report.txt ]] && cp "$IDX/.build/report.txt" "$IDX/report.failed.txt"
         lock_release "$IDX/.lock"
         die "index: could not be built - see the log ($IDX/report.failed.txt)"
@@ -376,6 +375,7 @@ ensure_index() {
     log "index: $(grep -c . "$IDX/samples.tsv") samples (header incl.), $(grep -c . "$IDX/mgs.tsv") MGS (header incl.) - $IDX/report.txt"
     local -a il=()
     mapfile -t il < <(grep -E '^(samples in map|raw BAM read groups|MGS in MAGvsGC|member MAGs|MGS):' "$IDX/report.txt")
-    mlog INDEX "index (re)built from $MMT_MAP + $MVG - details: index/report.txt" "${il[@]}"
+    mapfile -t -O "${#il[@]}" il < <(grep -E '^GeneCat abundance' "$IDX/report.txt")
+    mlog INDEX "index (re)built from $MMT_MAP + $MVG - details: $IDX/report.txt" "${il[@]}"
     grep -qE '^member MAGs: ok [0-9]+$' "$IDX/report.txt" || say "WARNING: index: $(grep -m1 '^member MAGs:' "$IDX/report.txt") - see $IDX/report.txt"
 }

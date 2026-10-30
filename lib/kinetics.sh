@@ -1,8 +1,12 @@
 # shellcheck shell=bash
-# kinetics_table BAM REF.fa CONTIGS.txt DIR LOG
+# kinetics_table BAM REF.fa CONTIGS.txt DIR
 #   ipdSummary (m6A + m4C, methylated fraction) and, from the SAME aligned reads, samtools mpileup -> sequence agreement.
 #   Taken unchanged in substance from the validated Ref-Based pipeline (2026_PA_RefMeth.sh, 20 Oct 2026 fixes included).
-#   Needs: SAMTOOLS IPDSUMMARY DUCKDB THREADS DUCK_MEM MIN_MAPQ CTX CLIP_MIN ; writes DIR/k.duckdb (table k) + DIR/stats.tsv:
+#   ipdSummary's own log stays in DIR (removed with the work folder): the kinetics model it loaded, its warnings and,
+#   after a failure, its last lines go to the run log ; the model also into DIR/stats.tsv (kinetics_model).
+#   Extra ipdSummary arguments (MMT_IPD_ARGS / --ipd-args, e.g. --ipdModel FILE): IPD_EXTRA.
+#   Needs: SAMTOOLS IPDSUMMARY DUCKDB THREADS DUCK_MEM MIN_MAPQ CTX CLIP_MIN IPD_EXTRA ; writes DIR/k.duckdb (table k) +
+#   DIR/stats.tsv:
 #     contig pos(1-based) strand(0 = +, 1 = -) base(on that strand) score tMean tErr modelPrediction ipdRatio coverage
 #     frac fracLow fracUp call(m6A/m4C/modified_base/none) identificationQv
 #     pile_depth  reads whose kinetics are on this strand at this position (= reads aligned to the OTHER strand:
@@ -19,7 +23,7 @@
 #   ipdSummary conventions: strand = 1 - read orientation ; a CSV row needs >= 3 reads ; frac only above 10 reads ;
 #   --maxCoverage default -1 silently drops one read per site -> set to 100000 (20 Oct fix).
 kinetics_table() {
-    local bam=$1 ref=$2 ctgs=$3 d=$4 lg=$5 pp n_csv chk n_lt mdiff
+    local bam=$1 ref=$2 ctgs=$3 d=$4 lg="$4/ipdSummary.log" pp n_csv chk n_lt mdiff model
     awk -F'\t' 'NR==FNR{k[$1]; next} ($1 in k){print $1 "\t0\t" $2}' "$ctgs" "$ref.fai" > "$d/regions.bed"
     #   pileup strand = ipdSummary's: reverse-aligned reads (, a #) -> strand 0 (+), base as printed ;
     #   forward-aligned reads (. A *) -> strand 1 (-), base complemented
@@ -72,9 +76,17 @@ kinetics_table() {
             if (o ~ /[MDN=X]/) rl += n; c = substr(c, RSTART + RLENGTH) }
         if (L >= m) print $3, $4, st
         if (R >= m) print $3, $4 + rl - 1, st }' > "$d/clips.tsv"
-    "$IPDSUMMARY" "$bam" --reference "$ref" -W "$ctgs" \
+    if ! "$IPDSUMMARY" "$bam" --reference "$ref" -W "$ctgs" \
         --identify m6A,m4C --methylFraction --mapQvThreshold "$MIN_MAPQ" --minCoverage 1 --maxCoverage 100000 -j "$THREADS" \
-        --gff "$d/calls.gff" --csv "$d/bases.csv" --log-file "$lg"
+        ${IPD_EXTRA[@]+"${IPD_EXTRA[@]}"} --gff "$d/calls.gff" --csv "$d/bases.csv" --log-file "$lg"; then
+        [[ ! -s $lg ]] || tail -n 30 "$lg" | sed 's/^/ipdSummary: /' || true    # no log when it stopped before opening it
+        local why; why=$(grep -E 'ERROR|Exception|Error' "$lg" 2> /dev/null | tail -n 1 | cut -c1-200 || true)
+        die "ipdSummary failed: ${why:-its messages are above in the run log}"
+    fi
+    model=$(grep -m1 -oE "Using [a-z-]+ kinetics model: .*" "$lg" | sed -E "s/^Using ([a-z-]+) kinetics model: '?([^']*)'?$/\2 (\1)/" || true)
+    log "ipdSummary: kinetics model ${model:-not found in its log}"
+    grep -E '\[(WARNING|ERROR|CRITICAL)\]' "$lg" | sort | uniq -c | sort -rn | head -n 20 | sed 's/^/ipdSummary: /' || true
+    printf 'kinetics_model\t%s\n' "${model:-unknown}" >> "$d/stats.tsv"
     wait "$pp" || die "pileup (samtools mpileup | awk) failed: $(tail -n 3 "$d/mpileup.log")"
     grep -v '^#' "$d/calls.gff" > "$d/calls.tsv" || true
     "$DUCKDB" -bail "$d/k.duckdb" -c "
@@ -129,5 +141,5 @@ kinetics_table() {
     read -r n_lt mdiff <<< "$chk"
     printf 'rows_pile_lt_cov\t%s\nmean_pile_minus_cov\t%s\nclip_points\t%s\n' "$n_lt" "$mdiff" "$(wc -l < "$d/clips.tsv")" >> "$d/stats.tsv"
     (( n_lt * 1000 <= n_csv )) || die "pile_depth < ipdSummary coverage in $n_lt of $n_csv rows (read sets differ)"
-    rm -rf "$d/bases.csv" "$d/calls.gff" "$d/calls.tsv" "$d/pile.tsv" "$d/mpileup.log" "$d/regions.bed" "$d/clips.tsv" "$d/duck_tmp"
+    rm -rf "$d/bases.csv" "$d/calls.gff" "$d/calls.tsv" "$d/pile.tsv" "$d/mpileup.log" "$d/regions.bed" "$d/clips.tsv" "$d/duck_tmp" "$lg"
 }

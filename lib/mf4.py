@@ -20,6 +20,7 @@ wrong). units.tsv = one row per assembly x MGS with a MAG there, with checksums 
 redone only when the contigs behind it change (not when unrelated lines of the map or MAGvsGC change). Reads: MATAFILER4 keeps every aligned read in <MF4 run>/<SmplID>/mapping/<SmplID>-smd.cram; alignments that
 failed its filter are flagged 0x200 (QC fail), duplicates 0x400.
 movies.tsv = the read groups of every raw BAM (movie, chemistry): the batch key for kinetics.
+abundance.tsv = sample x MGS pairs with abundance > 0 in GeneCat's MGS.matL0.txt (presence, also where no MAG was binned).
 """
 import argparse, collections, glob, gzip, hashlib, os, re, sys
 
@@ -122,6 +123,38 @@ def fasta_lengths(path):
     return lens
 
 
+def read_abundance(path, samples, mgs_ids, report):
+    """GeneCat's MGS abundance matrix -> [(sample, MGS, value)] for values > 0. Rows MGS x columns samples or the
+    transpose (whichever matches more names) ; a header one field short (R row names) is padded."""
+    if not path or not os.path.isfile(path):
+        report(f"GeneCat abundance: not found ({path}) - presence comes from MAGs only")
+        return []
+    rows = [l.rstrip("\r\n").split("\t") for l in opener(path) if l.strip()]
+    if len(rows) < 2:
+        report(f"GeneCat abundance: {path} is empty"); return []
+    hd, body = rows[0], rows[1:]
+    if len(hd) == len(body[0]) - 1:
+        hd = [""] + hd
+    S, M = set(samples), set(mgs_ids)
+    ms = sum(h in S for h in hd[1:]) * sum(r[0] in M for r in body)        # rows MGS, columns samples
+    sm = sum(h in M for h in hd[1:]) * sum(r[0] in S for r in body)        # rows samples, columns MGS
+    if not ms and not sm:
+        report(f"GeneCat abundance: {path}: no row / column names match the MGS and samples - not used")
+        return []
+    out = []
+    for r in body:
+        for h, v in zip(hd[1:], r[1:]):
+            smp, mgs = (h, r[0]) if ms >= sm else (r[0], h)
+            if smp in S and mgs in M:
+                try:
+                    if float(v) > 0: out.append((smp, mgs, v))
+                except ValueError:
+                    pass
+    report(f"GeneCat abundance: {path} ({'MGS x samples' if ms >= sm else 'samples x MGS'}): "
+           f"{len({m for _, m, _ in out})} MGS present in {len({s for s, _, _ in out})} samples ({len(out)} pairs > 0)")
+    return out
+
+
 def index(a):
     os.makedirs(a.out, exist_ok=True)
     rep_lines, fatal, seen = [], [], []     # seen: files read whose change rebuilds the index (assembly.txt, bin files)
@@ -188,6 +221,9 @@ def index(a):
                          f[ix] if ix is not None and ix < len(f) else "NA")
     rep = {m: r for m, r in rep.items() if m in members}
     report(f"MGS in MAGvsGC: {len(members)}   member MAGs (non-canopy): {sum(map(len, members.values()))}")
+    abund = read_abundance(a.abundance, list(sample), list(members), report)
+    if a.abundance and os.path.isfile(a.abundance):
+        seen.append(a.abundance)
 
     # ---- MAG -> SmplID -> assembly -> bin file -> contigs
     mag_info, by_binfile = {}, collections.defaultdict(dict)
@@ -319,6 +355,10 @@ def index(a):
         o.write("MGS\tcontig\tlength\n")
         for r in rep_ctg_rows:
             o.write("\t".join(map(str, r)) + "\n")
+    with open(os.path.join(a.out, "abundance.tsv"), "w") as o:
+        o.write("sample\tMGS\tabundance\n")
+        for r in abund:
+            o.write("\t".join(r) + "\n")
     with open(os.path.join(a.out, "movies.tsv"), "w") as o:
         o.write("sample\t" + "\t".join(MOVIE_COLS) + "\n")
         for r in mov:
@@ -469,6 +509,7 @@ def main():
     p = sp.add_parser("index")
     p.add_argument("--mf4-run", required=True); p.add_argument("--genecat", required=True)
     p.add_argument("--map", required=True); p.add_argument("--binner", default="SB"); p.add_argument("--out", required=True)
+    p.add_argument("--abundance", default="")
     p = sp.add_parser("assign")
     p.add_argument("--contigs", required=True); p.add_argument("--assembly", required=True)
     p.add_argument("--out", required=True); p.add_argument("--stats", required=True); p.add_argument("--depth", required=True)

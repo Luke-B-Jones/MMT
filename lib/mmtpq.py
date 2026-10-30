@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """MMT result tables: fixed schemas and one parquet writer for every result file.
 
-  split    a sorted kinetics export (MGScall) -> one file per MGS: OUT/<MGS>/<sample>.parquet
-  migrate  MGScall files of the old layout (MGS=<m>/sample=<S>/data.parquet) -> the new one (a list, one process)
+  split    a sorted kinetics export (MGScall) -> one file per MGS: OUT/<MGS>/<sample>.parquet, or the path --paths
+           gives for that MGS (MGS TAB relative path)
 
-Every result file has a fixed schema (also when empty: a glob read takes its schema from the first file), MGS and
-sample as columns, zstd, dictionary encoding for everything except positions, which are delta-encoded (DELTA_BINARY_
-PACKED: ~3 B/row less than a dictionary on positions), row groups of 256k rows. Files are written to a temp name and
-renamed. DuckDB >= 1.1 and pyarrow read them. Positions are signed (int32): differences of positions never overflow.
+Every result file has a fixed schema (also when empty: a glob read takes its schema from the first file), MGS, MAG
+and sample as columns (constant columns cost < 0.1 bit per row), zstd, dictionary encoding for everything except
+positions, which are delta-encoded (DELTA_BINARY_PACKED: ~3 B/row less than a dictionary on positions), row groups of
+256k rows, and the column conventions as file metadata (key "mmt": pyarrow schema.metadata, duckdb
+parquet_kv_metadata()). Files are written to a temp name and renamed. DuckDB >= 1.1 and pyarrow read them. Positions are
+signed (int32): differences of positions never overflow.
 """
-import argparse, os, sys
+import argparse, json, os, sys
 import pyarrow as pa, pyarrow.parquet as pq
 
 S, F, I8, U8, U16, I16, I32, B = pa.string(), pa.float32(), pa.int8(), pa.uint8(), pa.uint16(), pa.int16(), pa.int32(), pa.bool_()
@@ -17,18 +19,37 @@ KIN = [("coverage", I32), ("score", I32), ("ipdRatio", F), ("tMean", F), ("tErr"
        ("fracLow", F), ("fracUp", F), ("call", S), ("identificationQv", F), ("pile_depth", I32), ("n_ref", I32),
        ("top_alt", S), ("n_alt", I32), ("ctx_alt_pct", U8), ("ctx_alt_n", I32), ("clip_ctx_n", U16)]
 SCHEMA = {
-    "mgscall": [("MGS", S), ("sample", S), ("contig", S), ("pos", I32), ("strand", S), ("base", S)] + KIN,
+    "mgscall": [("MGS", S), ("MAG", S), ("sample", S), ("contig", S), ("pos", I32), ("strand", S), ("base", S)] + KIN,
     "ctg_sites": [("MGS", S), ("sample", S), ("read_set", S), ("side", I8), ("dist", I32), ("MAG", S), ("contig", S),
                   ("pos", I32), ("strand", S), ("base", S), ("block", S), ("instance", I32), ("block_pos", I32),
                   ("block_strand", S), ("ctx_dist", U8), ("gene", S), ("up_gene", S), ("up_dist", I16)] + KIN
                  + [("kin_fp", S), ("lift_fp", S)],
+}
+META = {   # column conventions, stored in every file (key "mmt")
+    "mgscall": {
+        "MAG": "MAG(s) whose reads made this table (mgs-rep: every MAG of the MGS in the sample, comma-separated)",
+        "contig": "reference contig, its MATAFILER4 name (mgs-rep / mag-rep: of the representative MAG ; mag-mag: of the MAG itself)",
+        "pos": "1-based position on the contig",
+        "strand": "+ / - : strand of the base whose kinetics are reported",
+        "base": "base on that strand (- strand: complement of the contig base)",
+        "rows": "every A and C with >= 3 kinetic reads (ipdSummary writes no row below 3) ; G/T only where ipdSummary "
+                "flags a kinetic signal (call modified_base) ; no row = < 3 reads",
+        "coverage": "kinetic reads (molecules) on this strand at this position",
+        "frac": "methylated fraction, only on rows called m6A / m4C with coverage > 10 (ipdSummary)",
+        "pile_depth/n_ref/top_alt/n_alt": "reads at the position on this strand / carrying the contig base / most common other "
+                                          "observation / its reads (same reads as the kinetics)",
+        "ctx_alt_pct/ctx_alt_n/clip_ctx_n": "within +-ctx bp on this strand: highest % (and count) of reads differing from "
+                                            "the contig ; reads with a clip point",
+    },
 }
 DELTA = {"pos", "block_pos", "r_start", "r_end", "c_start", "c_end", "b_start", "q_start", "q_end", "w_start", "w_end", "start", "end"}
 ROWS = 262144
 
 
 def schema(name):
-    return pa.schema(SCHEMA[name]) if isinstance(name, str) else name
+    if not isinstance(name, str):
+        return name
+    return pa.schema(SCHEMA[name], metadata={"mmt": json.dumps(META[name])} if name in META else None)
 
 
 def cast(t, sch):
@@ -75,8 +96,9 @@ def write(path, t, sch):
 
 # ============================================================================ MGScall
 def cmd_split(a):
-    """sorted export (MGS, contig, pos, strand) -> D/<MGS>/<sample>.parquet ; prints 'MGS<TAB>rows' per file"""
+    """sorted export (MGS, contig, pos, strand) -> D/<MGS>/<sample>.parquet (or --paths) ; prints 'MGS<TAB>rows' per file"""
     import numpy as np, pyarrow.compute as pc
+    paths = dict(l.rstrip("\n").split("\t")[:2] for l in open(a.paths) if l.strip()) if a.paths else {}
     f = pq.ParquetFile(a.input)
     cur, w, done = None, None, set()
     try:
@@ -92,8 +114,9 @@ def cmd_split(a):
                     if w: print(f"{cur}\t{w.close()}", flush=True); done.add(cur); w = None
                     if m in done: raise SystemExit(f"ERROR: export not grouped by MGS ({m} again)")
                     cur = m
-                    os.makedirs(os.path.join(a.out, cur), exist_ok=True)
-                    w = Writer(os.path.join(a.out, cur, f"{a.sample}.parquet"), "mgscall")
+                    path = os.path.join(a.out, paths.get(cur, os.path.join(cur, f"{a.sample}.parquet")))
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    w = Writer(path, "mgscall")
                 w.write(t.slice(int(i), int(j - i)))
         if w: print(f"{cur}\t{w.close()}", flush=True); w = None
     except BaseException:
@@ -101,32 +124,13 @@ def cmd_split(a):
         raise
 
 
-def cmd_migrate(a):
-    """old-layout MGScall files (no MGS / sample columns, maybe unsorted) -> new files, sorted, with both columns ;
-    --list: old TAB new TAB MGS TAB sample per line ; prints 'old<TAB>rows' per file written (the caller removes it)"""
-    for l in open(a.list):
-        if not l.strip(): continue
-        old, new, mgs, sample = l.rstrip("\n").split("\t")
-        try: t = pq.read_table(old)
-        except Exception as e:                     # a damaged old file: reported, the caller sets it aside
-            print(f"{old}\tERROR {type(e).__name__}: {str(e)[:200]}".replace("\n", " "), flush=True); continue
-        n = t.num_rows
-        for k, v in (("MGS", mgs), ("sample", sample)):
-            if k not in t.column_names: t = t.append_column(k, pa.array([v] * n, S))
-        t = t.sort_by([("contig", "ascending"), ("pos", "ascending"), ("strand", "ascending")])
-        os.makedirs(os.path.dirname(new) or ".", exist_ok=True)
-        if write(new, t, "mgscall") != n: raise SystemExit(f"ERROR: {old}: row count changed")
-        print(f"{old}\t{n}", flush=True)
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = ap.add_subparsers(dest="cmd", required=True)
     p = sp.add_parser("split"); p.add_argument("--input", required=True); p.add_argument("--out", required=True)
-    p.add_argument("--sample", required=True)
-    p = sp.add_parser("migrate"); p.add_argument("--list", required=True)
+    p.add_argument("--sample", required=True); p.add_argument("--paths", default="")
     a = ap.parse_args()
-    {"split": cmd_split, "migrate": cmd_migrate}[a.cmd](a)
+    {"split": cmd_split}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # MMT derep-ctg (alias: dereplicate-contigs, derep) - each MGS as a short list of collinear blocks ("dereplicated
 # contigs"), every occurrence in every MAG down to the base (lift). Sourced by the mmt wrapper. Method, outputs and
-# columns: docs/derep-ctg.md (copied into OUT/derep-ctg/README.md). Engine: lib/derep.py.
+# columns: docs/derep-ctg.md. Engine: lib/derep.py.
 
 DEREP_METHOD=3        # bump when a code change alters results -> the next run redoes every MGS
 DEREP_PREP_METHOD=2   # bump when lib/derep.py prep output changes -> prep rebuilt
@@ -154,8 +154,8 @@ module_main() {
     derep_settings
     resolve_out
     job_tag
-    start_log "$MMT_OUT/logs/derep-ctg/$(date +%Y%m%d-%H%M%S)_$JOBTAG.log"
-    say "MMT $(mmt_version) derep-ctg -> $MMT_OUT (log: $MMT_LOG)"
+    start_log derep-ctg "$(date +%Y%m%d-%H%M%S)_$JOBTAG"
+    say "MMT $(mmt_version) derep-ctg -> $MMT_OUT/derep-ctg${MMT_LOG_DIR:+ (log: $MMT_LOG)}"
     log "command: mmt derep-ctg ${IDS:+--mgs $IDS }${PART:+--part $PART }(force=$FORCE dry=$DRY list=$LIST prep_only=$PREP_ONLY debug=$MMT_DEBUG) on $(hostname), job $JOBTAG"
     desc="${IDS:+--mgs $IDS }${PART:+--part $PART }"
     (( FORCE )) && desc+="--force "
@@ -175,9 +175,8 @@ module_main() {
     if (( PREP_ONLY )); then
         ensure_prep; say "prep ready: $PREP ($(( $(grep -c . "$PREP/assemblies.tsv") - 1 )) assemblies)"
         mlog END "prep ready ($(( $(grep -c . "$PREP/assemblies.tsv") - 1 )) assemblies) ; $(( ($(date +%s) - t0) / 60 )) min"
-        trap - EXIT; return 0
+        RUN_ENDED=1; return 0
     fi
-    TMPROOT=$(abspath "${MMT_TMP:-${TMPDIR:-/tmp}}")/mmt; mkdir -p "$TMPROOT" || die "cannot create work space $TMPROOT"; work_root
     BASE_FP=$(md5str "$DEREP_METHOD|$PREP_FP|$DEREP_TXT")
     sel=""
     if [[ -n $IDS ]]; then
@@ -204,25 +203,24 @@ module_main() {
         n=$(( n + 1 ))
         [[ $st == todo ]] && todo+=("$m|$fp")
     done <<< "$plan"
-    if (( n == 0 )) && [[ -n $PART ]]; then say "part $PART holds no MGS - nothing to do"; mlog END "part $PART holds no MGS"; trap - EXIT; return 0; fi
+    if (( n == 0 )) && [[ -n $PART ]]; then say "part $PART holds no MGS - nothing to do"; mlog END "part $PART holds no MGS"; RUN_ENDED=1; return 0; fi
     (( n )) || die "no MGS selected (none with a usable MAG?)"
     say "plan: ${#todo[@]} MGS to do, $(( n - ${#todo[@]} )) up to date (selection: $n)"
     mlog PLAN "${#todo[@]} MGS to do$( (( ${#todo[@]} )) && echo " ($(id_list "${todo[@]%%|*}"))"), $(( n - ${#todo[@]} )) up to date (selection: $n)"
-    if (( LIST )); then (( ${#todo[@]} == 0 )) || printf '%s\n' "${todo[@]%%|*}" >&3; mlog END "listing only"; trap - EXIT; return 0; fi
+    if (( LIST )); then (( ${#todo[@]} == 0 )) || printf '%s\n' "${todo[@]%%|*}" >&3; mlog END "listing only"; RUN_ENDED=1; return 0; fi
     if (( DRY )); then printf '%s\n' "$plan" | awk -F'\t' 'NF {printf "  %s %s (%s MAGs)\n", $1, $2, $4}' | while read -r l; do say "$l"; done
-        say "dry run - nothing done"; trap - EXIT; return 0; fi
+        say "dry run - nothing done"; RUN_ENDED=1; return 0; fi
     (( ${#todo[@]} )) && ensure_prep
-    local t; t=$(tmpname "$D/README.md"); cp "$MMT_HOME/docs/derep-ctg.md" "$t"; publish "$t" "$D/README.md"; write_out_readme
     for x in "${todo[@]}"; do
         m=${x%%|*}; fp=${x#*|}
         isolated run_mgs "$m" "$fp"
         if (( RC == 0 )); then n_ok=$(( n_ok + 1 )); row=0; mlog MGS "$m $(awk -F'\t' 'NR == 1 {for (i = 1; i <= NF; i++) h[$i] = i} NR == 2 {printf "%s: %s MAGs, %s core + %s accessory blocks, %s instances", $h["status"], $h["n_mags"], $h["n_blocks_core"], $h["n_blocks_accessory"], $h["n_instances"]}' "$D/$m/summary.tsv" 2> /dev/null)"
-        else failed+=("$m"); row=$(( row + 1 )); log "== $m FAILED (exit $RC)"; err=$(last_error); mlog FAIL "$m: ${err:-exit $RC} - details: ${MMT_LOG#"$MMT_OUT"/}"; fi
+        else failed+=("$m"); row=$(( row + 1 )); log "== $m FAILED (exit $RC)"; err=$(last_error); mlog FAIL "$m: ${err:-exit $RC} - $(log_ref)"; fi
         (( row < 5 )) || { say "5 MGS failed in a row - stopping (a problem common to all MGS? see the log)"; break; }
     done
     "$PYTHON" "$MMT_HOME/lib/derep.py" summary --out "$D" > /dev/null || log "WARNING: summary.tsv not rebuilt"
     mlog END "$n_ok MGS done, ${#failed[@]} failed$( (( ${#failed[@]} )) && echo " ($(id_list "${failed[@]}"))") ; $(( ($(date +%s) - t0) / 60 )) min"
-    trap - EXIT
+    RUN_ENDED=1
     if (( ${#failed[@]} )); then
         say "finished with errors after $(( ($(date +%s) - t0) / 60 )) min: ${#failed[@]} MGS failed: ${failed[*]:0:20} - rerun the same command to resume"
         exit 1

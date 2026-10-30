@@ -194,8 +194,8 @@ for (smp, c), rs in alt_of.items():
 bad = [r[:6] for r in E if r[1] == "instance_end" and r[5] > len(altmol[(r[0], r[2])])]
 t("edges: n_event counts each molecule once", not bad, bad[:5])
 st = {}
-for f in glob.glob(f"{D}/_state/*.tsv"):
-    if f.endswith(".stats.tsv"): continue
+for f in glob.glob(f"{D}/stats/*.tsv"):
+    if f.endswith(".run.tsv"): continue
     for l in open(f).read().splitlines()[1:]:
         x = l.split("\t"); st[(x[0], os.path.basename(f)[:-4])] = x[1]
 t("state: every result done", st == {k: "done" for k in want}, st)

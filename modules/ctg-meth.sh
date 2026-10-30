@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # MMT ctg-meth - methylation of every MAG's own contigs, per sample, lifted onto the derep-ctg blocks, with read sets
-# per junction (conformation). Sourced by the mmt wrapper. Method, outputs, columns: docs/ctg-meth.md (copied into
-# OUT/ctg-meth/README.md). Engine: lib/ctgmeth.py ; kinetics: lib/kinetics.sh ; read index: lib/reads.sh.
+# per junction (conformation). Sourced by the mmt wrapper. Method, outputs, columns: docs/ctg-meth.md.
+# Engine: lib/ctgmeth.py ; kinetics: lib/kinetics.sh ; read index: lib/reads.sh.
 # shellcheck source=../lib/kinetics.sh
 source "$MMT_HOME/lib/kinetics.sh"
 # shellcheck source=../lib/reads.sh
@@ -43,15 +43,16 @@ Other
 Settings: CTGMETH_* in config/mmt.conf. A changed setting redoes the results it affects ; a newer derep-ctg result
 only re-annotates them (no kinetics recomputed).
 Presence check: before a sample's raw BAM is read, the molecules MATAFILER4 placed on each MGS's MAG(s) are counted;
-an MGS with fewer than CTGMETH_PRESENT_MOL is recorded as 'absent' (no files) and not processed.
-Every run is summarised in OUT/mmt.log (plan per MGS, each sample x MGS outcome, failures); 'mmt status -o OUT'.
+an MGS with fewer than CTGMETH_PRESENT_MOL (default 1) is recorded as 'absent' (no files) and not processed.
+Every run is summarised in the mmt log OUT/mmt_<date>.log (plan per MGS, each sample x MGS outcome, failures);
+'mmt status -o OUT'. Run logs only with -l DIR (DIR/ctg-meth/<sample>.log).
 
 Output (in OUT/ctg-meth)
   <MGS>/<S>.parquet            sites: read set 'all' then the junction read sets (long format, column read_set)
   <MGS>/junctions/<S>.parquet  one row per read set x side: breakpoint, partner, molecules, callable distance, blocks
   <MGS>/edges/<S>.parquet      every instance end and contig end: molecules spanning it / with a breakpoint in its gap
   <MGS>/reads/<S>.parquet      every aligned piece of every molecule used (placement, read sets)
-  _state/<S>.tsv               per MGS: status, fingerprints, counts
+  stats/<S>.tsv                per MGS: status, fingerprints, counts ; stats/<S>.run.tsv: the sample's last run
 Read all samples of an MGS: SELECT * FROM read_parquet('OUT/ctg-meth/MGS.12/*.parquet')
 
 Examples
@@ -107,8 +108,11 @@ module_main() {
     ctgmeth_settings
     resolve_out
     job_tag
-    start_log "$MMT_OUT/logs/ctg-meth/$(date +%Y%m%d-%H%M%S)_$JOBTAG.log"
-    say "MMT $(mmt_version) ctg-meth -> $MMT_OUT (log: $MMT_LOG)"
+    local lname
+    if [[ -n $SAMPLES && ! -f $SAMPLES && $SAMPLES != *[,\ ]* ]]; then lname=$SAMPLES
+    else lname="$(date +%Y%m%d-%H%M%S)_$JOBTAG$( (( LIST )) && echo _list || true)"; fi
+    start_log ctg-meth "$lname"
+    say "MMT $(mmt_version) ctg-meth -> $MMT_OUT/ctg-meth${MMT_LOG_DIR:+ (log: $MMT_LOG)}"
     log "command: mmt ctg-meth ${SELECT:+--select $SELECT }${SAMPLES:+--samples $SAMPLES }(force=$FORCE dry=$DRY list=$LIST debug=$MMT_DEBUG) on $(hostname), job $JOBTAG"
     desc="${SELECT:+--select $SELECT }${SAMPLES:+--samples $SAMPLES }"
     (( FORCE )) && desc+="--force "
@@ -122,9 +126,6 @@ module_main() {
     setup_tools
     "$PYTHON" -c 'import sys, edlib, numpy, pyarrow; assert sys.version_info >= (3, 10)' 2> /dev/null \
         || die "python $PYTHON: ctg-meth needs python >= 3.10 with edlib, numpy and pyarrow"
-    TMPROOT=$(abspath "${MMT_TMP:-${TMPDIR:-/tmp}}")/mmt
-    mkdir -p "$TMPROOT" || die "cannot create work space $TMPROOT"
-    work_root
     DUCK_MEM="$(( MEM_GB * 6 / 10 > 1 ? MEM_GB * 6 / 10 : 1 ))GB"
     SORT_T=$(( THREADS < 4 ? THREADS : 4 ))
     SORT_MEM="$(( MEM_GB * 1024 * 3 / 10 / SORT_T > 256 ? MEM_GB * 1024 * 3 / 10 / SORT_T : 256 ))M"
@@ -136,9 +137,9 @@ module_main() {
     IPD_VERSION=$("$IPDSUMMARY" --version 2>&1 | head -1 | tr '\t' ' ' || true)
 
     ensure_index
-    D="$MMT_OUT/ctg-meth"; STATE="$D/_state"
+    D="$MMT_OUT/ctg-meth"; STATE="$D/stats"
     DEREP=$(abspath "${DEREP:-$MMT_OUT/derep-ctg}")
-    mkdir -p "$STATE" "$MMT_OUT/logs/ctg-meth/ipdSummary"
+    mkdir -p "$STATE"
     pick_mgs
     pick_samples
     log "selection: ${#MGS_SEL[@]} MGS, ${#SAMPLE_SEL[@]} samples ; derep-ctg results: $DEREP"
@@ -158,21 +159,20 @@ module_main() {
     if (( LIST )); then
         (( ${#todo_samples[@]} == 0 )) || printf '%s\n' "${todo_samples[@]}" >&3
         mlog END "listed ${#todo_samples[@]} sample(s) with work ($n_units MGS x sample results) - nothing processed by a listing run"
-        trap - EXIT; return 0
+        RUN_ENDED=1; return 0
     fi
-    if (( DRY )); then say "dry run - nothing done"; trap - EXIT; return 0; fi
-    local t; t=$(tmpname "$D/README.md"); cp "$MMT_HOME/docs/ctg-meth.md" "$t"; publish "$t" "$D/README.md"; write_out_readme
+    if (( DRY )); then say "dry run - nothing done"; RUN_ENDED=1; return 0; fi
     for S in "${todo_samples[@]}"; do
         isolated process_sample "$S"
         if (( RC == 0 )); then n_ok=$(( n_ok + 1 )); else
             failed+=("$S"); err=$(last_error)
             log "== $S FAILED (exit $RC)"
-            mlog FAIL "$S: ${err:-exit $RC} - details: ${MMT_LOG#"$MMT_OUT"/}$( (( MMT_DEBUG )) && echo " ; work folder kept: $WROOT/ctg-meth/$S")"
+            mlog FAIL "$S: ${err:-exit $RC} - $(log_ref)$( (( MMT_DEBUG )) && echo " ; work folder kept: $WROOT/ctg-meth/$S")"
         fi
     done
     mixed_lift
     mlog END "$n_ok sample(s) processed, ${#failed[@]} failed$( (( ${#failed[@]} )) && echo " ($(id_list "${failed[@]}"))"), $n_skip already up to date ; $(( ($(date +%s) - t0) / 60 )) min"
-    trap - EXIT
+    RUN_ENDED=1
     if (( ${#failed[@]} )); then
         say "finished with errors after $(( ($(date +%s) - t0) / 60 )) min: ${#failed[@]} sample(s) failed: ${failed[*]} - rerun the same command to resume"
         exit 1
@@ -257,7 +257,6 @@ pick_samples() {   # SAMPLE_SEL ; RAW[S] CRAM[S] ASM[S] ; UNITS[S] = selected MG
     return 0
 }
 
-asm_fasta() { local f; for f in "$1/scaffolds.fasta.filt" "$1/scaffolds.fasta.filt.gz"; do [[ -s $f ]] && { echo "$f"; return 0; }; done; return 1; }
 
 plan_sample() {   # plan_sample S -> TODO_KIN (compute), TODO_LIFT (re-lift only), CURRENT, STALE (drop), N_CURRENT ;
                   # KFP / LFP[MGS]
@@ -266,7 +265,7 @@ plan_sample() {   # plan_sample S -> TODO_KIN (compute), TODO_LIFT (re-lift only
     declare -ga TODO_KIN=() TODO_LIFT=() STALE=() CURRENT=()
     declare -A ok=() okl=() old_st=()
     N_CURRENT=0
-    base="$CTGMETH_METHOD|$ASSIGN_METHOD|$SETTINGS|present=$CTGMETH_PRESENT_MOL|${CRAM[$S]}:$(stamp "${CRAM[$S]}")|${RAW[$S]}:$(stamp "${RAW[$S]}")"
+    base="$CTGMETH_METHOD|$ASSIGN_METHOD|$SETTINGS|present=$CTGMETH_PRESENT_MOL|ipd=${MMT_IPD_ARGS:-}|${CRAM[$S]}:$(stamp "${CRAM[$S]}")|${RAW[$S]}:$(stamp "${RAW[$S]}")"
     base+="|$(asm_fasta "${ASM[$S]}" || echo none):$(stamp "$(asm_fasta "${ASM[$S]}" || echo none)")"
     if [[ -f $STATE/$S.tsv ]]; then
         while IFS=$'\t' read -r m st kf lf _; do ok[$m]=$kf; okl[$m]=$lf; old_st[$m]=$st; done < <(tail -n +2 "$STATE/$S.tsv")
@@ -289,7 +288,7 @@ plan_sample() {   # plan_sample S -> TODO_KIN (compute), TODO_LIFT (re-lift only
 
 mixed_lift() {   # warn for selected MGS whose results (all samples) were lifted from different derep-ctg results
     local f m mixed=() sf=()
-    for f in "$STATE"/*.tsv; do [[ $f == *.stats.tsv || ! -f $f ]] || sf+=("$f"); done
+    for f in "$STATE"/*.tsv; do [[ $f == *.run.tsv || ! -f $f ]] || sf+=("$f"); done
     (( ${#sf[@]} )) || return 0
     while read -r m; do [[ -n ${IS_SEL[$m]:-} ]] && mixed+=("$m"); done < <(awk -F'\t' 'FNR > 1 && $2 == "done" && !s[$1 FS $4]++ {n[$1]++}
         END {for (m in n) if (n[m] > 1) print m}' "${sf[@]}" | sort -V)
@@ -300,7 +299,7 @@ files_ok() { [[ -f $D/$1/$2.parquet && -f $D/$1/junctions/$2.parquet && -f $D/$1
 
 # ============================================================================ one sample
 process_sample() {
-    local S=$1 LOCK="$STATE/$S.lock" m ts
+    local S=$1 LOCK m ts; LOCK="$STATE/$S.lock"
     ts=$(date +%s)
     lock_take "$LOCK" || die "$S: another job is working on this sample ($(cat "$LOCK/owner" 2> /dev/null)) - remove $LOCK if not"
     W="$WROOT/ctg-meth/$S"                 # this sample's work folder: ours while we hold the lock
@@ -436,7 +435,8 @@ compute_sample() {
         rm -f "$W"/aln/*.all.bam                                           # merged into all.bam
         rm -rf "$W/k"; mkdir -p "$W/k"
         "$SAMTOOLS" idxstats "$W/all.bam" | awk '$3 > 0 {print $1}' > "$W/k/contigs.txt"
-        kinetics_table "$W/all.bam" "$W/ref.fa" "$W/k/contigs.txt" "$W/k" "$MMT_OUT/logs/ctg-meth/ipdSummary/$S.log"
+        kinetics_table "$W/all.bam" "$W/ref.fa" "$W/k/contigs.txt" "$W/k"
+        cat "$W/k/stats.tsv" >> "$W/run.stats"
         log "$S: kinetics table ready ($(( $(date +%s) - t )) s)"
         touch "$W/kinetics.ok"
     fi
@@ -513,35 +513,7 @@ export_rows() {   # export_rows S : kinetics table -> W/k/export.parquet (MGS, s
     "$DUCKDB" -readonly "$K" -noheader -csv -separator $'\t' -c "SELECT MGS, count(*) FROM ex GROUP BY MGS ORDER BY MGS" > "$W/k/rows.tsv"
 }
 
-mag_ref() { echo "$TMPROOT/refs_mag/$(md5str "$1|${MAGREF_ASM:?}")"; }   # a MAG's reference (MAG names may hold any character)
-
-ensure_mag_refs() {   # ensure_mag_refs S ASSEMBLY_FASTA MAG... : TMPROOT/refs_mag/<md5>/{mag.fa,.fai,mag.mmi,stamp} for each MAG
-    local S=$1 asmf=$2 mag r st tmp; shift 2
-    local -a todo=()
-    declare -A want=()
-    for mag in "$@"; do
-        r=$(mag_ref "$mag")
-        st="$asmf:$(stamp "$asmf")|$(awk -F'\t' -v g="$mag" '$2 == g {print $1}' "$W/contigs.tsv" | sort | md5sum | cut -c1-16)"
-        want[$mag]=$st
-        [[ $(cat "$r/stamp" 2> /dev/null) == "$st" && -s $r/mag.mmi ]] || todo+=("$mag")
-    done
-    (( ${#todo[@]} )) || return 0
-    tmp=$(tmpname "$TMPROOT/refs_mag/build"); rm -rf "$tmp"; mkdir -p "$tmp"
-    for mag in "${todo[@]}"; do awk -F'\t' -v g="$mag" -v n="$(md5str "$mag")" '$2 == g {print $1 "\t" g "\t" n}' "$W/contigs.tsv"; done > "$tmp/contigs.tsv"
-    "$PYTHON" "$MMT_HOME/lib/ctgmeth.py" refs --fasta "$asmf" --contigs "$tmp/contigs.tsv" --out "$tmp"
-    for mag in "${todo[@]}"; do
-        r=$(mag_ref "$mag"); local b; b="$tmp/$(md5str "$mag")"
-        "$SAMTOOLS" faidx "$b/mag.fa"
-        "$PBMM2" index --preset CCS -j "$THREADS" "$b/mag.fa" "$b/mag.mmi"
-        echo "${want[$mag]}" > "$b/stamp"
-        [[ -d $r && $(cat "$r/stamp" 2> /dev/null) != "${want[$mag]}" ]] && rm -rf "$r"     # an outdated cache entry
-        mv -T "$b" "$r" 2> /dev/null || rm -rf "$b"                                          # another job was faster
-        [[ -s $r/mag.mmi ]] || die "reference of $mag missing after build ($r)"
-    done
-    rm -rf "$tmp"
-}
-
-write_state() {   # write_state S [T0] : _state/<S>.tsv = old lines minus TODO_KIN / TODO_LIFT (replaced) and STALE (dropped
+write_state() {   # write_state S [T0] : stats/<S>.tsv = old lines minus TODO_KIN / TODO_LIFT (replaced) and STALE (dropped
                   # with their files) ; one SAMPLE line in OUT/mmt.log
     local S=$1 ts=${2:-} m st now t kind line="" x
     local -a out=()
@@ -575,9 +547,10 @@ write_state() {   # write_state S [T0] : _state/<S>.tsv = old lines minus TODO_K
     } > "$t"
     publish "$t" "$STATE/$S.tsv"
     if [[ -f ${W:-}/run.stats ]]; then
-        t=$(tmpname "$STATE/$S.stats.tsv")
-        { printf 'sample\t%s\nupdated\t%s\n' "$S" "$now"; cat "$MMT_OUT/index/reads/_stats/$S.tsv" "$W/run.stats" 2> /dev/null || true; } > "$t"
-        publish "$t" "$STATE/$S.stats.tsv"
+        t=$(tmpname "$STATE/$S.run.tsv")
+        { printf 'sample\t%s\nupdated\t%s\nipdsummary_args\t%s\n' "$S" "$now" "${MMT_IPD_ARGS:-}"
+          cat "$IDX/reads/_stats/$S.tsv" "$W/run.stats" 2> /dev/null || true; } > "$t"
+        publish "$t" "$STATE/$S.run.tsv"
     fi
     log "$S: state: $(awk -F'\t' 'FNR > 1 {n[$2]++} END {for (s in n) printf "%s %d  ", s, n[s]}' "$STATE/$S.tsv")${STALE[*]:+ dropped: ${STALE[*]}}"
     for m in "${TODO_LIFT[@]}"; do out+=("$m re-lifted onto the current derep-ctg result"); done

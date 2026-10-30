@@ -44,7 +44,7 @@ o.close()"
 EOF
 printf '#!/usr/bin/env bash\nexit 0\n' > "$B/pbindex"
 if [[ -n $KT ]]; then
-    printf '#!/usr/bin/env bash\n[[ -n ${MMT_TEST_FAIL_IPD:-} && $* == *"/$MMT_TEST_FAIL_IPD/all.bam"* ]] && { echo "injected failure" >&2; exit 3; }\nexec "%s" "$@" %s\n' \
+    printf '#!/usr/bin/env bash\n[[ -n ${MMT_TEST_FAIL_IPD:-} && $* == *"/$MMT_TEST_FAIL_IPD/all"*".bam"* ]] && { echo "injected failure" >&2; exit 3; }\nexec "%s" "$@" %s\n' \
         "$KT" "${MODEL:+--ipdModel $MODEL}" > "$B/ipdSummary"
 fi
 chmod +x "$B"/*

@@ -129,7 +129,7 @@ t("MGS.2 (one MAG): every block from its two contigs, all instances complete",
 # ---------------------------------------------------------------- base-level frame (lift) against the assemblies
 COMP = str.maketrans("ACGTN", "TGCAN")
 rc = lambda q: q.translate(COMP)[::-1]
-idx = os.path.join(os.path.dirname(os.path.abspath(D)), "index")
+idx = os.environ.get("MMT_TEST_IDX") or os.path.join(os.path.dirname(os.path.abspath(D)), "index")   # MMT >= 0.5: a cache in the work space
 asm = {r.contig: r.assembly for r in pd.read_csv(f"{idx}/contigs.tsv.gz", sep="\t").itertuples()}
 seqs = {}
 def contig(c):

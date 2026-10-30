@@ -12,15 +12,16 @@ PY=$(command -v "${MMT_TEST_PY:-python3}") || { echo "no python"; exit 2; }
 IPD=${MMT_TEST_IPD:?set MMT_TEST_IPD}; DUCK=$(command -v "${MMT_TEST_DUCKDB:-duckdb}") || { echo "no duckdb"; exit 2; }
 rm -rf "$W"; mkdir -p "$W"
 NP=0 NF=0
+IDXD="$W/tmp/mmt/out_$(printf '%s' "$W/out" | md5sum | cut -c1-8)/index"   # the index cache of OUT (MMT work_root)
 t() { if eval "$2"; then echo "PASS  $1"; NP=$((NP + 1)); else echo "FAIL  $1"; NF=$((NF + 1)); fi; }
 OUT="$W/out"; D="$OUT/ctg-meth"
-run() {   # run COMMAND ARGS... -> RC, TERM_TXT, LOG (that run's log)
-    local cmd=$1 before; shift
-    before=$(find "$OUT/logs" -name '20*_*.log' 2> /dev/null | sort)     # run logs of every command (not ipdSummary/<S>.log)
-    "$MMT" "$cmd" "$@" --config "$W/test.conf" > "$W/term.txt" 2>&1; RC=$?
-    TERM_TXT=$(cat "$W/term.txt"); LOG=$(comm -13 <(echo "$before") <(find "$OUT/logs" -name '20*_*.log' 2> /dev/null | sort) | tail -1)
+run() {   # run COMMAND ARGS... -> RC, TERM_TXT, LOG (the run log written last ; -l keeps them)
+    local cmd=$1; shift
+    "$MMT" "$cmd" "$@" --config "$W/test.conf" -l "$W/logs" > "$W/term.txt" 2>&1; RC=$?
+    TERM_TXT=$(cat "$W/term.txt"); LOG=$(ls -t "$W"/logs/*/*.log 2> /dev/null | head -1)
     echo "    \$ mmt $cmd $*  -> exit $RC, $(grep -c . "$W/term.txt") terminal line(s)"
 }
+ML() { cat "$1"/mmt_*.log; }
 mt() { stat -c %Y "$D/$1/$2.parquet" 2> /dev/null || echo none; }
 q() { "$DUCK" -noheader -list -c "$1"; }
 # fracLow / fracUp left out: ipdSummary bootstraps them (its random stream depends on how the work is chunked), so they
@@ -68,8 +69,8 @@ t "--dry-run: 7 MGS x sample results, nothing written" '[[ $RC == 0 && $TERM_TXT
 echo "== full run with an injected ipdSummary failure in S3, then resume"
 MMT_TEST_FAIL_IPD=S3 run ctg-meth -o "$OUT"
 t "failure in S3: exit 1, others done, S3 named" '[[ $RC == 1 && $TERM_TXT == *"failed: S3"* && $(mt MGS.0 S1) != none && $(mt MGS.0 S5) != none && $(mt MGS.0 S3) == none ]]'
-t "failed sample: no lock left, work folder removed (no --debug), failure in mmt.log" \
-  '[[ ! -e $D/_state/S3.lock && -z $(ls -d "$W"/tmp/mmt/*_*/ctg-meth/S3 2> /dev/null) ]] && grep -q "ctg-meth  FAIL  S3: line [0-9]*: .*(exit 3)" "$OUT/mmt.log"'
+t "failed sample: no lock left, work folder removed (no --debug), failure in the mmt log" \
+  '[[ ! -e $D/stats/S3.lock && -z $(ls -d "$W"/tmp/mmt/*_*/ctg-meth/S3 2> /dev/null) ]] && ML "$OUT" | grep -q "ctg-meth  FAIL  S3: ipdSummary failed"'
 MMT_TEST_FAIL_IPD=S3 run ctg-meth -o "$OUT" --samples S3 --debug
 t "failure with --debug: work folder kept for the resume" '[[ $RC == 1 && -n $(ls "$W"/tmp/mmt/*_*/ctg-meth/S3/junctions.ok 2> /dev/null) ]]'
 run ctg-meth -o "$OUT"
@@ -119,26 +120,26 @@ mv "$W/keep/MGS.1" "$OUT/derep-ctg/MGS.1"
 
 echo "== MGScall on the same folder: shares the read index, plain layout"
 run MGScall --mag-rep -o "$OUT" --select MGS.0 --samples S1
-t "MGScall: exit 0, read index reused, result in MGScall/mag-rep/MGS.0/S1.parquet" \
-  '[[ $RC == 0 && -s $OUT/MGScall/mag-rep/MGS.0/S1.parquet && -s $LOG ]] && ! grep -q "assigning reads" "$LOG" && [[ $(q "SELECT min(MGS) || '"'"' '"'"' || min(sample) FROM '"'"'$OUT/MGScall/mag-rep/MGS.0/S1.parquet'"'"'") == "MGS.0 S1" ]]'
+F1=$(ls "$OUT"/mag-rep/MGS.0/S1/*.parquet 2> /dev/null | head -1)
+t "MGScall: exit 0, read index reused, result in mag-rep/MGS.0/S1/<MAG>.parquet" \
+  '[[ $RC == 0 && -s $F1 && -s $LOG ]] && ! grep -q "assigning reads" "$LOG" && [[ $(q "SELECT min(MGS) || '"'"' '"'"' || min(sample) FROM '"'"'$F1'"'"'") == "MGS.0 S1" ]]'
 
 echo "== outputs"
-t "README files, mmt.log (plan per MGS, a SAMPLE line per sample, END)" '[[ -s $D/README.md && -s $OUT/README.md ]] && grep -q "ctg-meth  PLAN  MGS.0: a MAG in the assembly of" "$OUT/mmt.log" && grep -q "ctg-meth  SAMPLE  S1: MGS.0 done (" "$OUT/mmt.log" && grep -q "ctg-meth  END  " "$OUT/mmt.log"'
+t "no README / index / logs in OUT ; mmt log (plan per MGS, a SAMPLE line per sample, END)" '[[ ! -e $D/README.md && ! -e $OUT/README.md && ! -e $OUT/index && ! -e $OUT/logs ]] && ML "$OUT" | grep -q "ctg-meth  PLAN  MGS.0: a MAG in the assembly of" && ML "$OUT" | grep -q "ctg-meth  SAMPLE  S1: MGS.0 done (" && ML "$OUT" | grep -q "ctg-meth  END  "'
 t "no temp file or lock left in OUT" '[[ -z $(find "$OUT" -name ".*.tmp" -o -name "*.lock" -o -name ".*.old") ]]'
 t "work folders removed after success" '[[ -z $(ls -d "$W"/tmp/mmt/*_*/ctg-meth/* 2> /dev/null) ]]'
 
 echo "== presence: an MGS with fewer molecules than CTGMETH_PRESENT_MOL is absent (no files), raw BAM not read"
 cp -a "$OUT" "$W/outp"; echo 'CTGMETH_PRESENT_MOL=100000' > "$W/present.conf"
-"$MMT" ctg-meth -o "$W/outp" --samples S5 --config "$W/test.conf" --config "$W/present.conf" > "$W/term.txt" 2>&1; rc=$?
-PL=$(ls -t "$W"/outp/logs/ctg-meth/*.log | head -1)
+"$MMT" ctg-meth -o "$W/outp" --samples S5 --config "$W/test.conf" --config "$W/present.conf" -l "$W/logsp" > "$W/term.txt" 2>&1; rc=$?
+PL=$(ls -t "$W"/logsp/ctg-meth/*.log | head -1)
 t "S5: every MGS absent, its files removed, raw BAM not read, logged" \
-  '[[ $rc == 0 && $(awk -F"\t" "NR > 1 {print \$2}" "$W/outp/ctg-meth/_state/S5.tsv" | sort -u) == absent && -z $(ls "$W"/outp/ctg-meth/MGS.*/S5.parquet 2> /dev/null) ]] && grep -q "raw BAM not read" "$PL" && grep -q "SAMPLE  S5: MGS.[0-9] absent (" "$W/outp/mmt.log"'
+  '[[ $rc == 0 && $(awk -F"\t" "NR > 1 {print \$2}" "$W/outp/ctg-meth/stats/S5.tsv" | sort -u) == absent && -z $(ls "$W"/outp/ctg-meth/MGS.*/S5.parquet 2> /dev/null) ]] && grep -q "raw BAM not read" "$PL" && ML "$W/outp" | grep -q "SAMPLE  S5: MGS.[0-9] absent ("'
 "$MMT" ctg-meth -o "$W/outp" --samples S5 --config "$W/test.conf" --config "$W/present.conf" > "$W/term.txt" 2>&1
 t "absent is a result: rerun has nothing to do" 'grep -q "plan: 0 sample(s) with work" "$W/term.txt"'
 "$MMT" status -o "$W/outp" --config "$W/test.conf" > "$W/term.txt" 2>&1
 t "status lists ctg-meth per MGS" 'grep -q "ctg-meth | MGS.0: planned for" "$W/term.txt" && grep -q "ctg-meth | MGS.0 absent 1: S5" "$W/term.txt" && grep -q "derep-ctg | done" "$W/term.txt"'
-t "index: movies.tsv + depth bins of every MAG contig" \
-  '[[ $(tail -n +2 "$OUT/index/movies.tsv" | wc -l) == 5 && $(q "SELECT count(DISTINCT contig) FROM read_parquet('"'"'$OUT/index/depth/*.parquet'"'"')") -ge 9 ]]'
+t "index (work space cache): movies.tsv of every raw BAM" '[[ $(tail -n +2 "$IDXD/movies.tsv" | wc -l) == 5 ]]'
 
 echo
 echo "$NP passed, $NF failed"

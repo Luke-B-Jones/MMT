@@ -13,6 +13,7 @@ Samples: S1 (A + A3 + B + J) ; S2 + S2.run2 co-assembled (group G2: aliases S2M1
 MGS.0  rep S1__SemiBin_1 (A) ; S1__SemiBin_6 (A3) ; S2.run2M2__SemiBin_3 (A) ; S3__SemiBin_2 (A2) ; S9__SemiBin_1 (no sample)
 MGS.1  rep S2.run2M2__SemiBin_5.fa.gz (B; MAG name ends .fa.gz like real SemiBin names) ; S1__SemiBin_4 (B) ; canopy row
 MGS.3  rep S3__SemiBin_7 - not in the bin file (unusable MGS)
+GeneCat abundance (Bin_SB/Annotation/Abundance/MGS.matL0.txt): MGS.1 also in S3, where no MAG of it was binned
 CRAM (MATAFILER4 style): minimap2 map-hifi to the sample's own assembly, CRAM without embedded reference,
   3 % of primary alignments flagged QC-fail (0x200), 2 % duplicate (0x400), unmapped reads kept.
 """
@@ -71,6 +72,10 @@ mvg = [("S2.run2M2__SemiBin_3", "MGS.0", ""), ("S1__SemiBin_1", "MGS.0", "*"), (
 with gzip.open(os.path.join(gc, "MAGvsGC.txt.gz"), "wt") as o:
     o.write("MAG\tMGS\tRepresentative4MGS\tCompleteness\tContamination\tN50\tother\n")
     for mag, m, st in mvg: o.write(f"{mag}\t{m}\t{st}\t95.1\t1.2\t5000\tg1,g2\n")
+# GeneCat's MGS abundance (R-style matrix: header one field short) ; MGS.1 present in S3 without a MAG there
+os.makedirs(os.path.join(gc, "Annotation", "Abundance"), exist_ok=True)
+with open(os.path.join(gc, "Annotation", "Abundance", "MGS.matL0.txt"), "w") as o:
+    o.write("S1\tS2\tS2.run2\tS3\n" "MGS.0\t20.1\t18.2\t18.4\t19.9\n" "MGS.1\t20.3\t20.0\t19.8\t0.4\n" "MGS.3\t0\t0\t0\t14.0\n")
 for m, mag, a, b in (("MGS.0", "S1__SemiBin_1", "S1", "SemiBin_1"), ("MGS.1", "S2.run2M2__SemiBin_5.fa.gz", "G2", "SemiBin_5.fa.gz")):
     name = f"{m}.ctgs.{mag}"; name = name[:-3] if name.endswith(".gz") else name
     name = (name if name.endswith((".fa", ".fna", ".fasta")) else name + ".fna") + ".gz"

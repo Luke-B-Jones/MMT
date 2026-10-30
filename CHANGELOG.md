@@ -1,9 +1,52 @@
 # Changelog
 
-Versions follow `MAJOR.MINOR.PATCH` (file `VERSION`). Results record the version that made them (`_state/*.tsv`,
-`mmt.log`). A change that alters results also bumps the command's method version (`MGSCALL_METHOD` in
+Versions follow `MAJOR.MINOR.PATCH` (file `VERSION`). Results record the version that made them (`stats/*.tsv`,
+the mmt log). A change that alters results also bumps the command's method version (`MGSCALL_METHOD` in
 `modules/MGScall.sh`, `DEREP_METHOD` in `modules/derep-ctg.sh`, `CTGMETH_METHOD` / `LIFT_METHOD` in
 `modules/ctg-meth.sh`, `ASSIGN_METHOD` in `lib/reads.sh`), so the next run redoes them.
+
+## 0.6.0 - 2026-10-29
+
+- **`MGScall --mag-mag`** - each MAG's reads (as in mag-rep) called on that MAG's own contigs instead of the
+  representative: `mag-mag/<MGS>/<S>/<MAG>.parquet`, `contig` = the MAG's contig (MATAFILER4 name). The MAG references
+  are cut from the sample's assembly (`scaffolds.fasta.filt[.gz]`) and cached in the work space (shared with ctg-meth).
+  Same samples, filters, columns, stats and layers as mag-rep; nothing is linked (other reference). No change to the
+  results of the other modes (no re-run).
+
+## 0.5.0 - 2026-10-29
+
+Output folder: only results. `-o OUT` holds one folder per analysis and the dated log - nothing else.
+- **Layout** - `OUT/mgs-rep/`, `OUT/mag-rep/` (no `MGScall/` level), `OUT/derep-ctg/`, `OUT/ctg-meth/`; `_state/` is
+  now `stats/` (`<S>.tsv` per MGS, `<S>.run.tsv` = the sample's last run, was `<S>.stats.tsv`). No README files in OUT
+  (documentation lives in `docs/`). No `OUT/index/`: the MATAFILER4 / GeneCat index and the per-sample read -> MAG
+  tables are a cache in the work space (`<tmp>/mmt/<OUT name>_<key>/index/`, rebuilt when missing; use shared scratch
+  for `--tmp` on a cluster). The 1 kb read-depth tables are no longer written (nothing used them).
+- **Logs** - the folder's log is `OUT/mmt_<date>.log` (today's date, or `MMT_LOG_DATE` - a pipeline sets it once so a
+  whole run writes one file). Run logs only with **`-l/--log DIR`** (all commands): `DIR/<analysis>/<sample>.log` for a
+  one-sample run (appended), else `DIR/<analysis>/<date>_<job>.log`; ipdSummary's log is no longer kept apart - the
+  kinetics model it loaded, its warnings and, after a failure, its last lines go into the run log. Without `-l` no run
+  log is kept; after a failure its last 25 lines are printed to the terminal (sbatch .out).
+- **mag-rep = every MAG apart** - for every sample with a MAG of the MGS (was: the representative's own sample only),
+  each MAG's reads on the representative: `mag-rep/<MGS>/<S>/<MAG>.parquet` (strains apart, cross-sample). Where a
+  sample has one MAG of the MGS the table equals mgs-rep's: the mode run second hard-links it (status `linked`) instead
+  of computing it (not with `--force`: that always computes). Several MAGs of one MGS are called in separate
+  ipdSummary runs ("layers").
+- **`MAG` column** in every MGScall table (mgs-rep: the MAGs pooled, comma-separated). Column conventions (1-based
+  positions, strand / base, rows kept) are stored in each file's parquet metadata (key `mmt`).
+- **G/T rows with a kinetic signal** - besides every A and C, G/T rows that ipdSummary flags (`modified_base`) are kept
+  (other / unknown modifications); before, they were dropped. (ctg-meth: A/C only, as before.)
+- **Presence** - the 10-molecule rule is gone (MGScall: any reads; ctg-meth `CTGMETH_PRESENT_MOL` default 1).
+  GeneCat's MGS abundance table (`Bin_<binner>/Annotation/Abundance/MGS.matL0.txt`) is read into the index: its value
+  is in every stats row (`abundance`); the PLAN lines and `mmt status` list samples where the MGS is present but was
+  not binned. MGScall status `absent` is now `no_reads`.
+- **`--ipd-args "ARGS"` / `MMT_IPD_ARGS`** - extra ipdSummary arguments, as they are (e.g. `--ipdModel FILE`); part of
+  every result's fingerprint. The kinetics model ipdSummary used and the raw BAM's chemistry are recorded per sample
+  (`stats/<S>.run.tsv`); `mmt status` lists the models.
+- `mmt status` reads the index (rebuilds it if missing) and reports `linked`, MAG tables, not-binned samples, models.
+- Removed: migration of MMT <= 0.2 layouts, `modules/dereplicate-contigs.sh` (old copy; `dereplicate-contigs` stays an
+  alias of `derep-ctg`).
+- Upgrading: `MGSCALL_METHOD` 2 - every MGScall result is redone (new columns and rows); the results of 0.4 in
+  `OUT/MGScall/`, `OUT/index/`, `OUT/logs/`, `OUT/README.md` and `OUT/mmt.log` are not used any more: delete them.
 
 ## 0.4.0 - 2026-10-28
 

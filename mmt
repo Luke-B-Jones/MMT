@@ -17,23 +17,27 @@ Methylation (PacBio HiFi kinetics: m6A, m4C) on top of a MATAFILER4 run and its 
 Usage: mmt <command> [options]
 
 Commands
-  MGScall   methylation of each MGS on its representative MAG, per sample
-              --mgs-rep  reads of every MAG of the MGS   |   --mag-rep  reads of the representative MAG only
+  MGScall   methylation of each MGS per sample: --mgs-rep  the reads of every MAG of the MGS pooled, on the
+              representative | --mag-rep  each MAG's reads apart, on the representative | --mag-mag  each MAG's
+              reads on the MAG itself
   derep-ctg each MGS as a short list of collinear blocks ("dereplicated contigs") with every occurrence in
               every MAG down to the base, block sequences and block order along the contigs
               (also: dereplicate-contigs, derep)
   ctg-meth  methylation of every MAG's own contigs per sample, lifted onto the derep-ctg blocks, with read
               sets per junction (conformation) of a contig
-  check     show the settings in effect, check tools and inputs (with -o: build / refresh the index there)
-  status    what is done per MGS in an output folder: per sample done / absent / not yet (also into OUT/mmt.log)
+  check     show the settings in effect, check tools and inputs (with -o: build / refresh the index)
+  status    what is done per MGS in an output folder: per sample done / linked / not yet ... (also into the mmt log)
   version   print the version (and git commit)
   help      this text, or 'mmt help <command>'
 
 Settings: config/mmt.conf (defaults) -> config/site.conf (your cluster) -> \$MMT_CONFIG -> --config FILE
-          -> command-line options. Results folder (-o) is reused by every run and every command: one folder per
-          command inside it (MGScall/<mode>/, derep-ctg/, ctg-meth/), index/, logs/, and OUT/mmt.log = the log of
-          every run (plan per MGS, each sample x MGS outcome, failures). Work folders (--tmp) are removed when a
-          sample ends; --debug keeps them.
+          -> command-line options.
+Results (-o): one folder per analysis (mgs-rep/, mag-rep/, mag-mag/, derep-ctg/, ctg-meth/), each with its tables and
+          stats/ (per sample: what is done, the run's read counts, chemistry and kinetics model), and mmt_<date>.log =
+          the log of every run (plan per MGS, each sample x MGS outcome, failures). Nothing else.
+Run logs: only with -l DIR (DIR/<analysis>/<sample>.log). Work space (--tmp): work folders (removed when a sample
+          ends; --debug keeps them) and caches (the MATAFILER4 / GeneCat index, reference indexes) - use a shared
+          scratch folder on a cluster.
 EOF
 }
 
