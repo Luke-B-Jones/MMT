@@ -17,7 +17,7 @@ t() { if eval "$2"; then echo "PASS  $1"; NP=$((NP + 1)); else echo "FAIL  $1"; 
 OUT="$W/out"; D="$OUT/ctg-meth"
 run() {   # run COMMAND ARGS... -> RC, TERM_TXT, LOG (the run log written last ; -l keeps them)
     local cmd=$1; shift
-    "$MMT" "$cmd" "$@" --config "$W/test.conf" -l "$W/logs" > "$W/term.txt" 2>&1; RC=$?
+    "$MMT" "$cmd" "$@" --config "$W/test.conf" --map "$W/mock/map.txt" -l "$W/logs" > "$W/term.txt" 2>&1; RC=$?
     TERM_TXT=$(cat "$W/term.txt"); LOG=$(ls -t "$W"/logs/*/*.log 2> /dev/null | head -1)
     echo "    \$ mmt $cmd $*  -> exit $RC, $(grep -c . "$W/term.txt") terminal line(s)"
 }
@@ -36,7 +36,6 @@ echo "== mock MATAFILER4 run (genes, catalogue, kinetics, conformations) + stand
 "$PY" "$HERE/ctgmeth_mock.py" "$W/mock" > /dev/null || { echo "mock failed"; exit 1; }
 bash "$HERE/standins.sh" "$W/bin" "$PY" "$IPD" "${MMT_TEST_IPD_MODEL:-}"
 cat > "$W/test.conf" << EOF
-MMT_MAP="$W/mock/map.txt"
 MMT_GENECAT="$W/mock/gc"
 MMT_SMRT_BIN="$W/bin"
 MMT_PYTHON="$PY"
@@ -131,13 +130,13 @@ t "work folders removed after success" '[[ -z $(ls -d "$W"/tmp/mmt/*_*/ctg-meth/
 
 echo "== presence: an MGS with fewer molecules than CTGMETH_PRESENT_MOL is absent (no files), raw BAM not read"
 cp -a "$OUT" "$W/outp"; echo 'CTGMETH_PRESENT_MOL=100000' > "$W/present.conf"
-"$MMT" ctg-meth -o "$W/outp" --samples S5 --config "$W/test.conf" --config "$W/present.conf" -l "$W/logsp" > "$W/term.txt" 2>&1; rc=$?
+"$MMT" ctg-meth -o "$W/outp" --samples S5 --config "$W/test.conf" --map "$W/mock/map.txt" --config "$W/present.conf" -l "$W/logsp" > "$W/term.txt" 2>&1; rc=$?
 PL=$(ls -t "$W"/logsp/ctg-meth/*.log | head -1)
 t "S5: every MGS absent, its files removed, raw BAM not read, logged" \
   '[[ $rc == 0 && $(awk -F"\t" "NR > 1 {print \$2}" "$W/outp/ctg-meth/stats/S5.tsv" | sort -u) == absent && -z $(ls "$W"/outp/ctg-meth/MGS.*/S5.parquet 2> /dev/null) ]] && grep -q "raw BAM not read" "$PL" && ML "$W/outp" | grep -q "SAMPLE  S5: MGS.[0-9] absent ("'
-"$MMT" ctg-meth -o "$W/outp" --samples S5 --config "$W/test.conf" --config "$W/present.conf" > "$W/term.txt" 2>&1
+"$MMT" ctg-meth -o "$W/outp" --samples S5 --config "$W/test.conf" --map "$W/mock/map.txt" --config "$W/present.conf" > "$W/term.txt" 2>&1
 t "absent is a result: rerun has nothing to do" 'grep -q "plan: 0 sample(s) with work" "$W/term.txt"'
-"$MMT" status -o "$W/outp" --config "$W/test.conf" > "$W/term.txt" 2>&1
+"$MMT" status -o "$W/outp" --config "$W/test.conf" --map "$W/mock/map.txt" > "$W/term.txt" 2>&1
 t "status lists ctg-meth per MGS" 'grep -q "ctg-meth | MGS.0: planned for" "$W/term.txt" && grep -q "ctg-meth | MGS.0 absent 1: S5" "$W/term.txt" && grep -q "derep-ctg | done" "$W/term.txt"'
 t "index (work space cache): movies.tsv of every raw BAM" '[[ $(tail -n +2 "$IDXD/movies.tsv" | wc -l) == 5 ]]'
 

@@ -152,6 +152,7 @@ load_config() {   # load_config "$@" : mmt.conf -> site.conf -> $MMT_CONFIG -> -
         fi
         prev=$a
     done
+    unset MMT_MAP     # the map is never taken from a config file: --map on the command line, every time
     return 0
 }
 
@@ -304,11 +305,11 @@ lock_stale() {   # lock_stale DIR HOST PID JOB
 lock_release() { rm -rf -- "$1"; }
 
 # ============================================================================ MF4 index (shared by all modules)
-INDEX_METHOD=4   # bump when lib/mf4.py index output changes -> every OUT rebuilds its index on the next run
+INDEX_METHOD=5   # bump when lib/mf4.py index output changes -> every OUT rebuilds its index on the next run
 INDEX_FILES="samples.tsv mgs.tsv mags.tsv units.tsv assemblies.tsv contigs.tsv.gz rep_contigs.tsv.gz movies.tsv abundance.tsv inputs.tsv report.txt"
 resolve_inputs() {   # absolute MMT_MAP, MMT_MF4_RUN (from the map when not given), MMT_GENECAT, MVG (MAGvsGC)
     local out rid
-    [[ -n ${MMT_MAP:-} ]] || usage_die "no MATAFILER4 map: --map FILE or MMT_MAP in config/site.conf"
+    [[ -n ${MMT_MAP:-} ]] || usage_die "--map FILE is required: the MATAFILER4 map of the run (every sample's raw kinetics BAM is read from it)"
     [[ -f $MMT_MAP ]] || die "map not found: $MMT_MAP"
     MMT_MAP=$(abspath "$MMT_MAP")
     if [[ -z ${MMT_MF4_RUN:-} ]]; then
@@ -364,7 +365,7 @@ ensure_index() {
             --binner "$MMT_BINNER" --abundance "$ABUND" --out "$IDX/.build"; then
         [[ -f $IDX/.build/report.txt ]] && cp "$IDX/.build/report.txt" "$IDX/report.failed.txt"
         lock_release "$IDX/.lock"
-        die "index: could not be built - see the log ($IDX/report.failed.txt)"
+        die "index: could not be built - see the error above$([[ -f $IDX/report.failed.txt ]] && echo " and $IDX/report.failed.txt")"
     fi
     local f
     for f in $INDEX_FILES; do publish "$IDX/.build/$f" "$IDX/$f"; done

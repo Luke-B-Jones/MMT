@@ -18,7 +18,7 @@ IDXD="$W/tmp/mmt/out_$(printf '%s' "$W/out" | md5sum | cut -c1-8)/index"   # the
 t() { if eval "$2"; then echo "PASS  $1"; NP=$((NP + 1)); else echo "FAIL  $1"; NF=$((NF + 1)); fi; }
 OUT="$W/out" LOGS="$W/logs"
 run() {   # run ARGS... -> RC, TERM_TXT (terminal output), LOG (the run log written last)
-    "$MMT" "$@" --config "$W/test.conf" -l "$LOGS" > "$W/term.txt" 2>&1; RC=$?
+    "$MMT" "$@" --config "$W/test.conf" --map "$W/mock/map.txt" -l "$LOGS" > "$W/term.txt" 2>&1; RC=$?
     TERM_TXT=$(cat "$W/term.txt"); LOG=$(ls -t "$LOGS"/*/*.log 2> /dev/null | head -1)
     echo "    \$ mmt $*  -> exit $RC, $(grep -c . "$W/term.txt") terminal line(s)"
 }
@@ -33,7 +33,6 @@ echo "== mock MATAFILER4 run + stand-ins"
 "$PY" "$HERE/mock_mf4.py" "$W/mock" > /dev/null || { echo "mock failed"; exit 1; }
 bash "$HERE/standins.sh" "$W/bin" "$(command -v "$PY")" "$IPD"
 cat > "$W/test.conf" << EOF
-MMT_MAP="$W/mock/map.txt"
 MMT_GENECAT="$W/mock/gc"
 MMT_SMRT_BIN="$W/bin"
 MMT_PYTHON="$(command -v "$PY")"
@@ -48,11 +47,42 @@ echo "== check, index (in the work space), concurrent index builds"
 run check -o "$OUT"
 t "check: exit 0, 2 usable MGS, GeneCat abundance read" '[[ $RC == 0 && $TERM_TXT == *"MGS: ok 2  rep_bin_not_in_bin_file 1"* && $TERM_TXT == *"GeneCat abundance: "*"3 MGS present in 4 samples"* ]]'
 t "index in the work space, not in OUT" '[[ -s $IDXD/units.tsv && -s $IDXD/abundance.tsv && ! -e $OUT/index ]]'
-( "$MMT" check -o "$W/out2" --config "$W/test.conf" > "$W/c1.txt" 2>&1; echo $? > "$W/c1.rc" ) &
-( "$MMT" check -o "$W/out2" --config "$W/test.conf" > "$W/c2.txt" 2>&1; echo $? > "$W/c2.rc" ) &
+( "$MMT" check -o "$W/out2" --config "$W/test.conf" --map "$W/mock/map.txt" > "$W/c1.txt" 2>&1; echo $? > "$W/c1.rc" ) &
+( "$MMT" check -o "$W/out2" --config "$W/test.conf" --map "$W/mock/map.txt" > "$W/c2.txt" 2>&1; echo $? > "$W/c2.rc" ) &
 wait
 t "two index builds at once: both succeed, same index, no lock left" \
   '[[ $(cat "$W/c1.rc")$(cat "$W/c2.rc") == 00 && -z $(ls -d "$W"/tmp/mmt/out2_*/index/.lock 2> /dev/null) ]] && cmp -s "$(ls "$W"/tmp/mmt/out2_*/index/units.tsv)" "$IDXD/units.tsv"'
+
+echo "== --map: required on the command line, every sample exactly one raw kinetics BAM of its own"
+chk() { "$MMT" check -o "$W/outm" --config "$W/test.conf" "$@" > "$W/term.txt" 2>&1; RC=$?; TERM_TXT=$(cat "$W/term.txt"); }
+echo "MMT_MAP=\"$W/mock/map.txt\"" > "$W/map.conf"
+chk --config "$W/map.conf"
+t "no --map: stops (a map set in a config file is ignored)" '[[ $RC != 0 && $TERM_TXT == *"--map FILE is required"* ]]'
+RAW=$(awk '$1 == "#DirPath" {print $2; exit}' "$W/mock/map.txt"); RAW=${RAW%/}
+cp "$RAW/m84_S1.hifi_reads.bam" "$RAW/m84_S1.hifi_reads.extra.bam"
+chk --map "$W/mock/map.txt"
+t "two BAMs named <SmplPrefix>*.bam: stops, naming the row and both files" \
+  '[[ $RC != 0 && $TERM_TXT == *"S1: 2 raw BAMs in"*"(m84_S1.hifi_reads.bam, m84_S1.hifi_reads.extra.bam)"* ]]'
+rm "$RAW/m84_S1.hifi_reads.extra.bam"
+awk -F'\t' -v OFS='\t' '$1 == "S3" {$2 = "m84_S1.hifi_reads"} 1' "$W/mock/map.txt" > "$W/map_shared.txt"
+chk --map "$W/map_shared.txt"
+t "one BAM for two samples: stops" '[[ $RC != 0 && $TERM_TXT == *"one raw BAM for 2 samples (S1 S3)"* ]]'
+awk '1; $1 == "S1" {print}' "$W/mock/map.txt" > "$W/map_dup.txt"
+chk --map "$W/map_dup.txt"
+t "a sample twice in the map: stops" '[[ $RC != 0 && $TERM_TXT == *"sample S1 is 2 times in the map"* ]]'
+awk -F'\t' -v OFS='\t' '$1 == "S3" {$2 = "m84_S9.hifi_reads"} 1' "$W/mock/map.txt" > "$W/map_none.txt"
+chk --map "$W/map_none.txt"
+t "no BAM for a sample: stops" '[[ $RC != 0 && $TERM_TXT == *"S3: 0 raw BAMs in"*"named m84_S9.hifi_reads*.bam"* ]]'
+mkdir -p "$W/nokin"; samtools view -b -x fi -x ri -o "$W/nokin/m84_S1.hifi_reads.bam" "$RAW/m84_S1.hifi_reads.bam"
+awk -F'\t' -v d="$W/nokin/" -v r="$RAW/" '$1 == "S1" {print "#DirPath\t" d; print; print "#DirPath\t" r; next} 1' \
+  "$W/mock/map.txt" > "$W/map_nokin.txt"
+chk --map "$W/map_nokin.txt"
+t "a raw BAM without kinetics: stops, naming the sample and file" \
+  '[[ $RC != 0 && $TERM_TXT == *"1 raw BAM(s) without readable kinetics"*"S1: $W/nokin/m84_S1.hifi_reads.bam"* ]]'
+printf 'not a bam' > "$W/nokin/m84_S1.hifi_reads.bam"
+chk --map "$W/map_nokin.txt"
+t "a raw 'BAM' that is not a BAM: stops, naming the sample" '[[ $RC != 0 && $TERM_TXT == *"without readable kinetics"*"S1: $W/nokin/"* ]]'
+t "the stops above left no index behind" '[[ -z $(ls "$W"/tmp/mmt/outm_*/index/samples.tsv 2> /dev/null) ]]'
 
 echo "== selection, listing, option errors"
 run MGScall --mag-rep -o "$OUT" --list-samples
@@ -150,9 +180,9 @@ t "lock of a dead process: taken over, sample redone, lock released" \
 
 echo "== logs: without -l no run log is kept ; a failure then prints the log's last lines"
 n0=$(find "$W/tmp" -name "*.log" | wc -l)
-"$MMT" MGScall --mgs-rep -o "$OUT" --samples S3 --force --config "$W/test.conf" > "$W/term.txt" 2>&1; RC=$?
+"$MMT" MGScall --mgs-rep -o "$OUT" --samples S3 --force --config "$W/test.conf" --map "$W/mock/map.txt" > "$W/term.txt" 2>&1; RC=$?
 t "no -l: success, nothing left in the work space or OUT" '[[ $RC == 0 && $(find "$W/tmp" -name "*.log" | wc -l) == "$n0" ]] && ML | grep -q "run log: no run log kept"'
-MMT_TEST_FAIL_IPD=S3 "$MMT" MGScall --mgs-rep -o "$OUT" --samples S3 --force --config "$W/test.conf" > "$W/term.txt" 2>&1; RC=$?
+MMT_TEST_FAIL_IPD=S3 "$MMT" MGScall --mgs-rep -o "$OUT" --samples S3 --force --config "$W/test.conf" --map "$W/mock/map.txt" > "$W/term.txt" 2>&1; RC=$?
 t "no -l, failure: the log's last lines on the terminal, log removed" '[[ $RC == 1 ]] && grep -q "last lines of the run log" "$W/term.txt" && grep -q "injected failure" "$W/term.txt" && [[ $(find "$W/tmp" -name "*.log" | wc -l) == "$n0" ]]'
 run MGScall --mgs-rep -o "$OUT" --samples S3
 
@@ -170,7 +200,7 @@ t "one SAMPLE line per sample processed, with every MGS (mag-rep: every MAG) out
   'ML | grep -q "mgs-rep  SAMPLE  S3: MGS.0 done ([0-9]* sites, [0-9]* molecules)" && ML | grep -q "mag-rep  SAMPLE  S1: MGS.0 S1__SemiBin_1 done ([0-9]* sites, [0-9]* molecules), S1__SemiBin_6 done" && ML | grep -q "mag-rep  SAMPLE  S3: MGS.0 S3__SemiBin_2 linked"'
 t "an index build and the dropped result are logged" 'ML | grep -q "INDEX  index (re)built" && ML | grep -q "SAMPLE  S1: MGS.1 dropped"'
 t "dry runs are not logged" '! ML | grep -q "dry"'
-t "MMT_LOG_DATE names the log file" 'MMT_LOG_DATE=run42 "$MMT" status -o "$OUT" --config "$W/test.conf" > /dev/null 2>&1 && grep -q "status  STATUS" "$OUT/mmt_run42.log" && rm "$OUT/mmt_run42.log"'
+t "MMT_LOG_DATE names the log file" 'MMT_LOG_DATE=run42 "$MMT" status -o "$OUT" --config "$W/test.conf" --map "$W/mock/map.txt" > /dev/null 2>&1 && grep -q "status  STATUS" "$OUT/mmt_run42.log" && rm "$OUT/mmt_run42.log"'
 
 echo "== status"
 run status -o "$OUT"

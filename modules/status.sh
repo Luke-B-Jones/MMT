@@ -6,7 +6,7 @@ module_help() {
     cat << 'EOF'
 mmt status - what is done per MGS in an output folder (printed, and added to the mmt log)
 
-Usage: mmt status -o OUT [--select IDS] [--tmp DIR]
+Usage: mmt status -o OUT --map FILE [--select IDS] [--tmp DIR]
 
 For mgs-rep, mag-rep, mag-mag and ctg-meth: per MGS, the samples it is planned for (a MAG of the MGS in the sample's assembly),
 the state of each - done, linked (mag-rep / mgs-rep: the other mode's identical table), no_reads, no_kinetics,
@@ -14,7 +14,7 @@ no_aligned, no_rows (ctg-meth: absent), or 'not yet' (no result: not run yet, or
 sample names, and the samples where GeneCat's abundance table has the MGS but no MAG of it was binned. mag-rep and
 mag-mag also count their MAG tables. The kinetics models ipdSummary used are listed. derep-ctg: per MGS whether its result exists.
   --select IDS   only these MGS ("MGS.12,MGS.40" or a file) ; default every MGS with any result
-Needs the index (rebuilt in the work space --tmp if missing: same inputs as the other commands) ; no SLURM job.
+Needs the index (rebuilt in the work space --tmp if missing: same inputs as the other commands, --map required) ; no SLURM job.
 EOF
 }
 

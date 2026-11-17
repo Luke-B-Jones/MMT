@@ -112,7 +112,10 @@ for k in (0, NM):
     with open(f"{RUN}/{s}/assemblies/metag/scaffolds.fasta.filt", "rb") as fi, gzip.open(f"{GCD}/Bin_SB/Genomes/MGS_ctg/{g}.ctgs.{m}.fna.gz", "wb") as fo:
         fo.write(fi.read())
 os.makedirs(f"{H}/raw")
-for s in maplines: open(f"{H}/raw/m_{s}.hifi_reads.bam", "w").close()
+for s in maplines:   # tiny real BAMs with kinetics: the index checks every raw BAM (derep-ctg reads none)
+    with open(f"{H}/raw/m_{s}.hifi_reads.sam", "w") as o:
+        o.write(f"@HD\tVN:1.6\n@RG\tID:1\tPU:m_{s}\nm_{s}/1/ccs\t4\t*\t0\t255\t*\t*\t0\t0\tACGT\t~~~~\tRG:Z:1\tfi:B:C,1,1,1,1\n")
+    os.system(f"samtools view -b -o {H}/raw/m_{s}.hifi_reads.bam {H}/raw/m_{s}.hifi_reads.sam && rm {H}/raw/m_{s}.hifi_reads.sam")
 with open(f"{H}/map.txt", "w") as o:
     o.write(f"#OutPath\t{H}/mf4/\n#RunID\trun\n#DirPath\t{H}/raw/\n#SmplID\tSmplPrefix\n" + "".join(f"{s}\tm_{s}.hifi_reads\n" for s in maplines))
 print(H, len(cat), "catalogue genes")

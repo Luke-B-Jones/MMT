@@ -5,13 +5,13 @@ module_help() {
     cat << 'EOF2'
 mmt check - show the settings in effect and check tools and inputs
 
-Usage: mmt check [-o OUT] [options]
+Usage: mmt check --map FILE [-o OUT] [options]
 
   Prints the settings after config/mmt.conf -> config/site.conf -> $MMT_CONFIG -> --config -> options, then checks
   every tool (path, version, required features) and the MATAFILER4 / GeneCat inputs.
   With -o OUT it also builds (or refreshes) the index of the MATAFILER4 / GeneCat layout (a cache in the work space,
   --tmp) and prints its report: samples, MGS and MAGs MMT can use, GeneCat's abundance table.
-  Runs no analysis. Takes the same input options as MGScall (-i, --genecat, --map, --config, --tmp, -t, --mem).
+  Runs no analysis. Takes the same input options as MGScall (--map (required), -i, --genecat, --config, --tmp, -t, --mem).
 EOF2
 }
 
@@ -32,7 +32,7 @@ module_main() {
              MMT_PYTHON MMT_SAMTOOLS MMT_DUCKDB MMT_MINIMAP2 MMT_THREADS MMT_MEM_GB; do
         printf '  %-16s %s\n' "$v" "${!v:-(empty)}"
     done
-    while read -r v; do printf '  %-24s %s\n' "$v" "${!v}"; done < <(compgen -v MGSCALL_; compgen -v DEREP_; compgen -v CTGMETH_)
+    while read -r v; do printf '  %-24s %s\n' "$v" "${!v}"; done < <(compgen -v MGSCALL_; compgen -v DEREP_; compgen -v CTGMETH_; compgen -v EXPORTMOT_)
     resolve_resources
     echo "  -> resources: $THREADS threads, $MEM_GB GB${SLURM_JOB_ID:+ (SLURM job $SLURM_JOB_ID)}"
     echo

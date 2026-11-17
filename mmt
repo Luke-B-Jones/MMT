@@ -25,6 +25,8 @@ Commands
               (also: dereplicate-contigs, derep)
   ctg-meth  methylation of every MAG's own contigs per sample, lifted onto the derep-ctg blocks, with read
               sets per junction (conformation) of a contig
+  export-mot  a Methyl-o-Type (mot) input table from the whole run: one FASTA per final MAG, per sample x MAG x raw
+              BAM the molecules MATAFILER4 aligned to that MAG, a molecule catalog and QC (-i RUN -gc GENECAT -o OUT.tsv)
   check     show the settings in effect, check tools and inputs (with -o: build / refresh the index)
   status    what is done per MGS in an output folder: per sample done / linked / not yet ... (also into the mmt log)
   version   print the version (and git commit)
@@ -46,6 +48,7 @@ module_file() {   # module_file COMMAND -> modules/<file>.sh
         MGScall|mgscall) echo "$MMT_HOME/modules/MGScall.sh" ;;
         derep-ctg|dereplicate-contigs|derep) echo "$MMT_HOME/modules/derep-ctg.sh" ;;
         ctg-meth|ctgmeth) echo "$MMT_HOME/modules/ctg-meth.sh" ;;
+        export-mot|exportmot) echo "$MMT_HOME/modules/export-mot.sh" ;;
         check)           echo "$MMT_HOME/modules/check.sh" ;;
         status)          echo "$MMT_HOME/modules/status.sh" ;;
         *) return 1 ;;

@@ -22,7 +22,7 @@ failed its filter are flagged 0x200 (QC fail), duplicates 0x400.
 movies.tsv = the read groups of every raw BAM (movie, chemistry): the batch key for kinetics.
 abundance.tsv = sample x MGS pairs with abundance > 0 in GeneCat's MGS.matL0.txt (presence, also where no MAG was binned).
 """
-import argparse, collections, glob, gzip, hashlib, os, re, sys
+import argparse, collections, gzip, hashlib, os, re, sys
 
 NAME_RE = re.compile(r"^(.+)__(.+)$")    # greedy first group = split at the last "__" (as GeneCat)
 
@@ -35,12 +35,57 @@ def stop(msg):
     sys.exit("ERROR: " + msg)
 
 
+# ============================================================================ MAG contigs
+def bin_contigs(mags, alias, sample_asm, binner):
+    """{MAG: MGS} -> ({MAG: dict(MGS, sample, asm, contigs, status)}, bin files read). GeneCat's rules: the MAG name is
+    "<sample or alias>__<bin>" (split at the last "__"), the alias resolves to its SmplID, the bin file is
+    <assembly>/Binning/<binner>/<SmplID> (lines: contig TAB bin). status: ok | bad_name | sample_not_in_map |
+    no_assembly | no_bin_file | bin_not_in_bin_file"""
+    mag_info, by_binfile = {}, collections.defaultdict(dict)
+    for mag, mgs in mags.items():
+        info = dict(MGS=mgs, sample="", asm="", contigs=[], status="ok")
+        mag_info[mag] = info
+        m = NAME_RE.match(mag)
+        if not m:
+            info["status"] = "bad_name"; continue
+        s = alias.get(m.group(1), m.group(1))
+        if s not in sample_asm:
+            info["status"] = "sample_not_in_map"; continue
+        info["sample"], info["asm"] = s, sample_asm[s]
+        if not info["asm"]:
+            info["status"] = "no_assembly"; continue
+        binfile = os.path.join(info["asm"], "Binning", binner, s)
+        by_binfile[binfile].setdefault(m.group(2), []).append(mag)
+    for binfile, bins in by_binfile.items():
+        if not os.path.isfile(binfile):
+            for ms in bins.values():
+                for mag in ms:
+                    mag_info[mag]["status"] = "no_bin_file"
+            continue
+        with open(binfile) as fh:
+            for line in fh:
+                f = line.rstrip("\n").split("\t")
+                if len(f) < 2 or f[0] == "Sequence ID" or f[1] not in bins:
+                    continue
+                for mag in bins[f[1]]:
+                    mag_info[mag]["contigs"].append(f[0])
+        for ms in bins.values():
+            for mag in ms:
+                if not mag_info[mag]["contigs"]:
+                    mag_info[mag]["status"] = "bin_not_in_bin_file"
+    return mag_info, list(by_binfile)
+
+
 # ============================================================================ index
-def read_map(path):
-    """-> samples [(SmplID, raw_bam, problem)], alias -> SmplID"""
+def scan_map(path):
+    """-> rows [dict(line, sample, group, dir, prefix, bams, problem)] in map order, alias -> SmplID. The raw BAMs are
+    found as MATAFILER4 finds its input (GenoMetaAss readMapS + discoverReadFiles with -inputBAMregex '.*\\.bam$'): in
+    the #DirPath above the row, the regular files whose name starts with SmplPrefix and ends in .bam (no SmplPrefix:
+    every .bam in #DirPath/Path). problem = why a row's folder cannot be searched ("" = it was searched)."""
     mapdir = os.path.dirname(os.path.abspath(path))
-    header, dirpath, samples, alias, group_n = None, "", [], {}, collections.Counter()
-    for raw in open(path):
+    header, dirpath, rows, alias, group_n = None, "", [], {}, collections.Counter()
+    listing = {}
+    for n, raw in enumerate(open(path), 1):
         line = raw.rstrip("\r\n")
         if not line.strip():
             continue
@@ -60,23 +105,62 @@ def read_map(path):
         if grp:                                   # GenoMetaAss: altCurSmp = SmplID . "M" . count within the group
             group_n[grp] += 1
             alias[f"{s}M{group_n[grp]}"] = s
-        raw_bam, problem = "", ""
         prefix, rpath = row.get("SmplPrefix", "").strip(), row.get("Path", "").strip()
-        if prefix:
-            base = os.path.join(dirpath, prefix)
-            cands = [base] if base.endswith(".bam") else [base + ".bam"]
-            hits = [c for c in cands if os.path.isfile(c)] or sorted(glob.glob(base + "*.bam"))
-        elif rpath:
-            hits = sorted(glob.glob(os.path.join(dirpath, rpath, "*.bam")))
-            hits = [h for h in hits if h.endswith(".hifi_reads.bam")] or hits
+        d = dirpath if prefix else (os.path.join(dirpath, rpath) if rpath else "")
+        hits, problem = [], ""
+        if not d:
+            problem = f"line {n} {s}: no SmplPrefix / Path, or no #DirPath above it"
         else:
-            hits = []
-        if len(hits) == 1:
-            raw_bam = hits[0]
-        else:
-            problem = "no_raw_bam" if not hits else "several_raw_bams"
-        samples.append((s, raw_bam, problem))
+            if d not in listing:
+                try:
+                    listing[d] = sorted(os.listdir(d))
+                except OSError as e:
+                    listing[d] = e
+            if isinstance(listing[d], OSError):
+                problem = f"line {n} {s}: cannot read {d} ({listing[d].strerror})"
+            else:
+                hits = [os.path.join(d, x) for x in listing[d] if x.startswith(prefix) and x.endswith(".bam")
+                        and os.path.isfile(os.path.join(d, x))]
+        rows.append(dict(line=n, sample=s, group=grp, dir=d, prefix=prefix, bams=hits, problem=problem))
+    return rows, alias
+
+
+def read_map(path):
+    """-> samples [(SmplID, raw_bam, AssmblGrps)], alias -> SmplID ; stops on any row whose raw kinetics BAM is not
+    exactly one file (scan_map finds them as MATAFILER4 does; MATAFILER4 uses all of them; MMT needs exactly one)."""
+    rows, alias = scan_map(path)
+    bad, samples = [], []
+    for r in rows:
+        hits = r["bams"]
+        if r["problem"]:
+            bad.append(r["problem"])
+        elif len(hits) != 1:
+            bad.append(f"line {r['line']} {r['sample']}: {len(hits)} raw BAMs in {r['dir']} named {r['prefix'] or ''}*.bam"
+                       + (f" ({', '.join(os.path.basename(h) for h in hits[:4])})" if hits else ""))
+        samples.append((r["sample"], hits[0] if len(hits) == 1 else "", r["group"]))
+    ids = collections.Counter(s for s, _, _ in samples)
+    bad += [f"sample {s} is {k} times in the map" for s, k in ids.items() if k > 1]
+    used = collections.defaultdict(list)
+    for s, r, _ in samples:
+        if r:
+            used[os.path.realpath(r)].append(s)
+    bad += [f"one raw BAM for {len(v)} samples ({' '.join(v)}): {k}" for k, v in used.items() if len(v) > 1]
+    if bad:
+        stop(f"map {path}: {len(bad)} problem(s) - every sample needs exactly one raw kinetics BAM of its own:\n  "
+             + "\n  ".join(bad[:30]) + (f"\n  ... {len(bad) - 30} more" if len(bad) > 30 else ""))
     return samples, alias
+
+
+def has_kinetics(raw, n=200):
+    """True when one of the first n reads carries per-read kinetics (fi = forward IPDs ; ip = subread IPDs)"""
+    import pysam
+    with pysam.AlignmentFile(raw, check_sq=False) as f:
+        for i, r in enumerate(f.fetch(until_eof=True)):
+            if r.has_tag("fi") or r.has_tag("ip"):
+                return True
+            if i + 1 >= n:
+                break
+    return False
 
 
 def first_line(path):
@@ -162,14 +246,25 @@ def index(a):
 
     # ---- samples
     maprows, alias = read_map(a.map)
+    nokin = []
+    for s, raw, _ in maprows:
+        try:
+            ok = has_kinetics(raw)
+        except Exception as e:      # not a BAM, truncated, unreadable
+            ok, raw = False, f"{raw} ({type(e).__name__}: {str(e)[:80]})"
+        if not ok:
+            nokin.append(f"{s}: {raw}")
+    if nokin:
+        stop(f"{len(nokin)} raw BAM(s) without readable kinetics (no fi / ip tag in the first reads):\n  "
+             + "\n  ".join(nokin[:30]))
     sample = {}
-    for s, raw, problem in maprows:
+    for s, raw, _ in maprows:
         sd = os.path.join(a.mf4_run, s)
         cram = os.path.join(sd, "mapping", f"{s}-smd.cram")
         at = os.path.join(sd, "assemblies", "metag", "assembly.txt")
         seen.append(at)
         asm = os.path.normpath(first_line(at)) if os.path.isfile(at) and first_line(at) else ""
-        why = [problem] if problem else []
+        why = []
         if not os.path.isfile(cram):
             why.append("no_cram")
         if not asm or not os.path.isdir(asm):
@@ -226,40 +321,9 @@ def index(a):
         seen.append(a.abundance)
 
     # ---- MAG -> SmplID -> assembly -> bin file -> contigs
-    mag_info, by_binfile = {}, collections.defaultdict(dict)
-    for mgs, mags in members.items():
-        for mag in mags:
-            info = dict(MGS=mgs, sample="", asm="", contigs=[], status="ok")
-            mag_info[mag] = info
-            m = NAME_RE.match(mag)
-            if not m:
-                info["status"] = "bad_name"; continue
-            s = alias.get(m.group(1), m.group(1))
-            if s not in sample:
-                info["status"] = "sample_not_in_map"; continue
-            info["sample"], info["asm"] = s, sample[s]["asm"]
-            if not info["asm"]:
-                info["status"] = "no_assembly"; continue
-            binfile = os.path.join(info["asm"], "Binning", a.binner, s)
-            by_binfile[binfile].setdefault(m.group(2), []).append(mag)
-    for binfile, bins in by_binfile.items():
-        seen.append(binfile)
-        if not os.path.isfile(binfile):
-            for mags in bins.values():
-                for mag in mags:
-                    mag_info[mag]["status"] = "no_bin_file"
-            continue
-        with open(binfile) as fh:
-            for line in fh:
-                f = line.rstrip("\n").split("\t")
-                if len(f) < 2 or f[0] == "Sequence ID" or f[1] not in bins:
-                    continue
-                for mag in bins[f[1]]:
-                    mag_info[mag]["contigs"].append(f[0])
-        for mags in bins.values():
-            for mag in mags:
-                if not mag_info[mag]["contigs"]:
-                    mag_info[mag]["status"] = "bin_not_in_bin_file"
+    mag_info, binfiles = bin_contigs({mag: mgs for mgs, mags in members.items() for mag in mags}, alias,
+                                     {s: v["asm"] for s, v in sample.items()}, a.binner)
+    seen += binfiles
     st = collections.Counter(i["status"] for i in mag_info.values())
     report("member MAGs: " + "  ".join(f"{k} {v}" for k, v in sorted(st.items())))
     for mag, i in list(mag_info.items()):

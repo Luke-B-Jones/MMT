@@ -38,8 +38,8 @@ run mgs-rep first, then mag-rep only computes samples with several MAGs of an MG
    `<S>/mapping/<S>-smd.cram` (minimap2 map-hifi to the sample's own assembly) whose contig belongs to an MGS MAG.
    Alignments MATAFILER4 flagged as failed (0x200: > 5 % edits, < 50 % of the read aligned or MAPQ < 30) are never
    used; duplicates (0x400) only with `MGSCALL_KEEP_DUP=1`. No new competitive mapping: MATAFILER4 already decided.
-4. **Kinetics reads.** The selected reads are taken from the sample's raw kinetics BAM (map `#DirPath` +
-   `SmplPrefix`.bam; one pass), split into one pseudo-read per strand (`ccs-kinetics-bystrandify`) and grouped by MGS
+4. **Kinetics reads.** The selected reads are taken from the sample's raw kinetics BAM (the one `<SmplPrefix>*.bam`
+   in the map's `#DirPath` above the row, as MATAFILER4 finds it; `--map` is required; one pass), split into one pseudo-read per strand (`ccs-kinetics-bystrandify`) and grouped by MGS
    (mag-rep, mag-mag: by MAG).
 5. **Alignment** of each group to its MGS's representative only (mag-mag: to its MAG only - the MAG's contigs taken from
    the sample's assembly `scaffolds.fasta.filt[.gz]`, the same contigs GeneCat binned) (`pbmm2 --preset CCS -y MGSCALL_MIN_IDENTITY`).

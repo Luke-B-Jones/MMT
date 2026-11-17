@@ -14,7 +14,7 @@ module_help() {
     cat << 'EOF'
 mmt ctg-meth - methylation of every MAG's own contigs per sample, lifted onto the derep-ctg blocks
 
-Usage: mmt ctg-meth -o OUT [options]          (needs mmt derep-ctg results in OUT/derep-ctg, or --derep DIR)
+Usage: mmt ctg-meth -o OUT --map FILE [options] (needs mmt derep-ctg results in OUT/derep-ctg, or --derep DIR)
 
 For every sample and every selected MGS with a MAG in the sample's assembly: the sample's PacBio HiFi reads that
 MATAFILER4 placed on that MAG (its CRAM), aligned to the MAG's own contigs, ipdSummary m6A + m4C from the kinetics:
@@ -28,7 +28,7 @@ Every row is placed on the derep-ctg blocks (block, block_pos, block strand, ins
 difference) and on the MAG's genes. No SNV calling: only large rearrangements make read sets.
 
 Inputs (defaults from config/site.conf)
-  -i, --mf4-run DIR / --genecat DIR / --map FILE   as for every command
+  --map FILE (required) / -i, --mf4-run DIR / --genecat DIR   as for every command
   --derep DIR         derep-ctg results (default OUT/derep-ctg) ; an MGS without a current result there is skipped
 Selection
   --select IDS        only these MGS ("MGS.12,MGS.40" or a file) ; --mgs is the same

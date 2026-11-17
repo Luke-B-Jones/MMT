@@ -5,6 +5,38 @@ the mmt log). A change that alters results also bumps the command's method versi
 `modules/MGScall.sh`, `DEREP_METHOD` in `modules/derep-ctg.sh`, `CTGMETH_METHOD` / `LIFT_METHOD` in
 `modules/ctg-meth.sh`, `ASSIGN_METHOD` in `lib/reads.sh`), so the next run redoes them.
 
+## 0.8.0 - 2026-11-17
+
+- **`mmt export-mot -i RUN -gc GENECAT -o OUT.tsv`** - a Methyl-o-Type input table for the whole run, plus a library
+  `OUT.motlib/`: one bgzip FASTA per final MAG (every non-canopy MAGvsGC row, MGS `?` included; MATAFILER4's own
+  contigs from `scaffolds.fasta.filt`, circular ones flagged from `scaffolds.fasta.circ`, checked base by base against
+  GeneCat's FASTA where it has one), and per sample x MAG x raw BAM the molecules (`movie/zmw`) MATAFILER4's CRAM
+  places uniquely on that MAG (QC-fail / duplicate-flagged ones included and marked). Molecule catalog (parquet per
+  sample), QC tables, manifest; COMPLETE / PARTIAL / FAILED with every left-out item named. The map comes from
+  GeneCat's own records (`--map` overrides); raw BAMs from MATAFILER4's `input_raw.txt`, else the map; several BAMs
+  per sample and co-assemblies handled. Assignment is competitive within each sample's (co-)assembly, not cohort-wide.
+  Tested against `mot plan` (mot 0.6.5-alpha). See docs/export-mot.md.
+- `lib/mf4.py`: `scan_map` (map rows with every BAM MATAFILER4 would read) and `bin_contigs` (MAG -> contigs by
+  GeneCat's rules) split out of `read_map` / `index` for export-mot; the index and every MMT result are unchanged
+  (same files, byte for byte, on the test run).
+
+## 0.7.0 - 2026-11-04
+
+- **`--map` is required on every command line** (MGScall, ctg-meth, derep-ctg, check, status): the run's MATAFILER4
+  map. It is never taken from a config file any more (`MMT_MAP` in a config is ignored), so a stale map cannot be used
+  by accident. Drivers pass the map they already hold (e.g. `--map "$MAP"`).
+- **Raw kinetics BAM found exactly as MATAFILER4 finds its input** (GenoMetaAss readMapS + discoverReadFiles with
+  `-inputBAMregex '.*\.bam$'`): in the `#DirPath` above the sample's row, the files named `<SmplPrefix>*.bam` (no
+  SmplPrefix: every `.bam` in `#DirPath/Path`). MMT's own "exact `<SmplPrefix>.bam` first" preference and the
+  `*.hifi_reads.bam` preference are gone (MATAFILER4 has neither).
+- **Hard stops before any work** (the index build), each naming the rows: a sample with none or several such BAMs, one
+  BAM for two samples, a sample twice in the map, a BAM that does not open or carries no kinetics (`fi` or `ip` in its
+  first reads). Before, such samples were skipped with a status (`no_raw_bam`, `several_raw_bams`).
+- `INDEX_METHOD` 5: every OUT rebuilds its index once (minutes). Results are not redone: their fingerprints use the raw
+  BAM's path, size and time, which are unchanged wherever the BAM is the same file.
+- `analysis/mmt_landscape.py` (not part of the `mmt` command): `summarise --run FILE` - technical variance between
+  listed samples of one AssmblGrps, as two result sets (in-batch, across-batch); see its header.
+
 ## 0.6.0 - 2026-10-29
 
 - **`MGScall --mag-mag`** - each MAG's reads (as in mag-rep) called on that MAG's own contigs instead of the

@@ -10,7 +10,7 @@ module_help() {
     cat << 'EOF'
 mmt derep-ctg - each MGS as a short list of collinear blocks ("dereplicated contigs")
 
-Usage: mmt derep-ctg -o OUT [options]          (also accepted: mmt dereplicate-contigs, mmt derep)
+Usage: mmt derep-ctg -o OUT --map FILE [options] (also accepted: mmt dereplicate-contigs, mmt derep)
 
 For every MGS (GeneCat species bin): the genes of all its MAGs (MATAFILER4 prodigal genes, GeneCat 95 % catalogue)
 -> gene families (catalogue genes that are variants of one gene merged by context + protein identity) -> blocks =
@@ -22,7 +22,7 @@ contigs (links), and every base of every instance on its block (lift: input of `
 Inputs (defaults from config/site.conf)
   -i, --mf4-run DIR   MATAFILER4 run folder (default: the map's #OutPath/#RunID)
   --genecat DIR       GeneCat folder (Bin_<binner>/MAGvsGC.txt.gz + compl.incompl.<id>.fna.clstr.idx + .prot.faa)
-  --map FILE          MATAFILER4 map
+  --map FILE          the run's MATAFILER4 map - required (raw kinetics BAM: the one .bam named <SmplPrefix>* in the #DirPath above the row)
 Selection
   --mgs IDS           only these MGS: "MGS.12,MGS.40" or a file (one ID per line); default every MGS with a usable MAG
                       (--select is the same)

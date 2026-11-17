@@ -13,7 +13,7 @@ IDXD="$W/tmp/mmt/out_$(printf '%s' "$W/out" | md5sum | cut -c1-8)/index"   # the
 t() { if eval "$2"; then echo "PASS  $1"; NP=$((NP + 1)); else echo "FAIL  $1"; NF=$((NF + 1)); fi; }
 OUT="$W/out"; D="$OUT/derep-ctg"
 run() {   # run ARGS... -> RC, TERM_TXT (terminal output)
-    "$MMT" derep-ctg "$@" --config "$W/test.conf" -l "$W/logs" > "$W/term.txt" 2>&1; RC=$?
+    "$MMT" derep-ctg "$@" --config "$W/test.conf" --map "$W/mock/map.txt" -l "$W/logs" > "$W/term.txt" 2>&1; RC=$?
     TERM_TXT=$(cat "$W/term.txt")
     echo "    \$ mmt derep-ctg $*  -> exit $RC, $(grep -c . "$W/term.txt") terminal line(s)"
 }
@@ -36,7 +36,6 @@ EOF
 echo "== mock MATAFILER4 run + GeneCat"
 "$PY" "$HERE/derep_mock.py" "$W/mock" > /dev/null || { echo "mock failed"; exit 1; }
 cat > "$W/test.conf" << EOF
-MMT_MAP="$W/mock/map.txt"
 MMT_GENECAT="$W/mock/gc"
 MMT_PYTHON="$PY"
 MMT_TMP="$W/tmp"
@@ -85,14 +84,14 @@ t "DEREP_MAX_SKIP=03: usage error 2" '[[ $RC == 2 ]]'
 
 echo "== SLURM-like: two parts at once on a fresh folder (shared index + prep build), then on the prepared one"
 O3="$W/out3"
-( "$MMT" derep-ctg -o "$O3" --part 1/2 --config "$W/test.conf" > "$W/q1.txt" 2>&1; echo $? > "$W/q1.rc" ) &
-( "$MMT" derep-ctg -o "$O3" --part 2/2 --config "$W/test.conf" > "$W/q2.txt" 2>&1; echo $? > "$W/q2.rc" ) &
+( "$MMT" derep-ctg -o "$O3" --part 1/2 --config "$W/test.conf" --map "$W/mock/map.txt" > "$W/q1.txt" 2>&1; echo $? > "$W/q1.rc" ) &
+( "$MMT" derep-ctg -o "$O3" --part 2/2 --config "$W/test.conf" --map "$W/mock/map.txt" > "$W/q2.txt" 2>&1; echo $? > "$W/q2.rc" ) &
 wait
 t "two parts from scratch: both exit 0, prep built once, all 3 MGS" \
   '[[ $(cat "$W/q1.rc")$(cat "$W/q2.rc") == 00 && $(cat "$W"/q?.txt | grep -c "prep: catalogue") == 1 && $(ls -d "$O3"/derep-ctg/MGS.* | wc -l) == 3 ]]'
 
-( "$MMT" derep-ctg -o "$OUT" --part 1/2 --config "$W/test.conf" > "$W/p1.txt" 2>&1; echo $? > "$W/p1.rc" ) &
-( "$MMT" derep-ctg -o "$OUT" --part 2/2 --config "$W/test.conf" > "$W/p2.txt" 2>&1; echo $? > "$W/p2.rc" ) &
+( "$MMT" derep-ctg -o "$OUT" --part 1/2 --config "$W/test.conf" --map "$W/mock/map.txt" > "$W/p1.txt" 2>&1; echo $? > "$W/p1.rc" ) &
+( "$MMT" derep-ctg -o "$OUT" --part 2/2 --config "$W/test.conf" --map "$W/mock/map.txt" > "$W/p2.txt" 2>&1; echo $? > "$W/p2.rc" ) &
 wait
 t "two parts: both exit 0, all 3 MGS done, no lock / temp left" \
   '[[ $(cat "$W/p1.rc")$(cat "$W/p2.rc") == 00 && -s $D/MGS.0/blocks.parquet && -s $D/MGS.1/blocks.parquet && -s $D/MGS.2/blocks.parquet ]] && [[ -z $(ls -d "$D"/.lock* "$D"/.MGS* "$D"/.prep* "$W"/tmp/mmt/derep_* 2> /dev/null) ]]'
@@ -107,7 +106,7 @@ grep -E "^(FAIL|all|[0-9]+ FAILED)" "$W/truth.txt" | sed 's/^/    /'
 t "truth: $(grep -c ^PASS "$W/truth.txt") checks pass" '[[ $rc == 0 ]]'
 
 echo "== determinism: a fresh output folder (relative -o, one job) gives identical tables"
-( cd "$W" && "$MMT" derep -o out_b --config "$W/test.conf" > "$W/b.txt" 2>&1 ); rc=$?
+( cd "$W" && "$MMT" derep -o out_b --config "$W/test.conf" --map "$W/mock/map.txt" > "$W/b.txt" 2>&1 ); rc=$?
 t "fresh run: exit 0, same tables (also as the concurrent parts run)" '[[ $rc == 0 ]] && same_results "$D" "$W/out_b/derep-ctg" && same_results "$O3/derep-ctg" "$D"'
 
 echo "== selection, force"
@@ -233,7 +232,7 @@ t "mixed MAG: flagged, its copies make no linker, every truth check still passes
 echo "== a results folder of MMT <= 0.2 (OUT/dereplicate-contigs, MGS=<MGS> folders) is moved, its prep reused"
 O4="$W/out4"; mkdir -p "$O4"; cp -r "$D" "$O4/dereplicate-contigs"
 for d in "$O4"/dereplicate-contigs/MGS.*; do mv "$d" "$O4/dereplicate-contigs/MGS=${d##*/}"; done
-"$MMT" derep-ctg -o "$O4" --config "$W/test.conf" > "$W/term.txt" 2>&1; RC=$?; TERM_TXT=$(cat "$W/term.txt")
+"$MMT" derep-ctg -o "$O4" --config "$W/test.conf" --map "$W/mock/map.txt" > "$W/term.txt" 2>&1; RC=$?; TERM_TXT=$(cat "$W/term.txt")
 t "old folder moved, prep reused, MGS redone in the new layout, no MGS= folder left" \
   '[[ $RC == 0 && $TERM_TXT == *"moved "* && $TERM_TXT != *"prep: catalogue"* && $TERM_TXT == *"plan: 3 MGS to do"* && ! -e $O4/dereplicate-contigs && -s $O4/derep-ctg/MGS.0/lift.parquet && -z $(ls -d "$O4"/derep-ctg/MGS=* 2> /dev/null) ]]'
 

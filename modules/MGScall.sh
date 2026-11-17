@@ -14,7 +14,7 @@ module_help() {
     cat << 'EOF'
 mmt MGScall - methylation of each MGS per sample (ipdSummary m6A + m4C)
 
-Usage: mmt MGScall (--mgs-rep | --mag-rep | --mag-mag) -o OUT [options]
+Usage: mmt MGScall (--mgs-rep | --mag-rep | --mag-mag) -o OUT --map FILE [options]
 
 Mode (one per run; each writes its own folder OUT/<mode>/)
   --mgs-rep           per sample, the reads of EVERY MAG of the MGS in it, pooled, on the representative
@@ -27,7 +27,7 @@ the same table: the second of them run links (hard link) the first one's file in
 Inputs (defaults from config/site.conf)
   -i, --mf4-run DIR   MATAFILER4 run folder (default: the map's #OutPath/#RunID)
   --genecat DIR       GeneCat folder (with Bin_<binner>/MAGvsGC.txt.gz)
-  --map FILE          MATAFILER4 map (raw kinetics BAMs: #DirPath + SmplPrefix + .bam)
+  --map FILE          the run's MATAFILER4 map - required (raw kinetics BAM: the one .bam named <SmplPrefix>* in the #DirPath above the row)
 Output, logs and work space
   -o, --out DIR       results folder - reuse it: finished results are kept, new ones added, changed inputs redone
   -l, --log DIR       keep the run logs: DIR/<mode>/<sample>.log (one sample per run) or DIR/<mode>/<date>_<job>.log,

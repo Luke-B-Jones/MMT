@@ -276,7 +276,11 @@ for s in samples:
     open(f"{sd}/assemblies/metag/assembly.txt", "w").write(ASM[sample_asm[s]]["dir"] + "/\n")
     open(f"{sd}/mapping/{s}-smd.cram", "w").close()
 raw = os.path.join(H, "raw"); os.makedirs(raw)
-for s in samples: open(f"{raw}/m84_{s}.hifi_reads.bam", "w").close()
+for s in samples:   # a real (tiny) unaligned BAM with kinetics: the index checks every raw BAM, derep-ctg reads none
+    with open(f"{raw}/m84_{s}.hifi_reads.sam", "w") as o:
+        o.write("@HD\tVN:1.6\tSO:unknown\n@RG\tID:1a2b3c4d\tPU:m84_" + s + "\tPM:REVIO\n"
+                "m84_" + s + "/1/ccs\t4\t*\t0\t255\t*\t*\t0\t0\tACGT\t~~~~\tRG:Z:1a2b3c4d\tfi:B:C,10,10,10,10\n")
+    os.system(f"samtools view -b -o {raw}/m84_{s}.hifi_reads.bam {raw}/m84_{s}.hifi_reads.sam && rm {raw}/m84_{s}.hifi_reads.sam")
 with open(f"{H}/map.txt", "w") as o:
     o.write(f"#OutPath\t{H}/mf4/\n#RunID\tmock\n#DirPath\t{raw}/\n#SmplID\tSmplPrefix\tAssmblGrps\n")
     for s in samples: o.write(f"{s}\tm84_{s}.hifi_reads\t{'G1' if s in ('P17', 'P18') else ''}\n")

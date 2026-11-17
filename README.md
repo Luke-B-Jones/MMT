@@ -15,12 +15,13 @@ Version: see `VERSION` and `CHANGELOG.md`. `mmt version` also prints the git com
 | `mmt MGScall --mag-mag` | each MAG's reads on that MAG's own contigs (not the representative) |
 | `mmt derep-ctg` | per MGS: a short list of collinear blocks ("dereplicated contigs") from all its MAGs, with every occurrence in every MAG down to the base (lift table), block sequences, block order along the contigs, genes, gene families and the MAG contig sequences (old name `dereplicate-contigs` still works) |
 | `mmt ctg-meth` | per MGS x sample: every MAG's own contigs -> m6A / m4C per site, placed on the derep-ctg blocks; plus read sets per junction (other conformations of a contig, and the as-assembled one at the same breakpoint) with their own calls on the junction flanks |
+| `mmt export-mot` | the whole run as one Methyl-o-Type (mot) input table: one FASTA per final MAG, per sample x MAG x raw BAM the molecules MATAFILER4 aligned to that MAG (QC-flagged ones included), a molecule catalog and QC (`-i RUN -gc GENECAT -o OUT.tsv`; no `--map` needed) |
 | `mmt check` | settings in effect, tool and input checks; with `-o OUT` also builds the index and reports usable samples / MGS |
 | `mmt status -o OUT` | per MGS and command: the samples it is planned for and their state (done / linked / not yet ...), with names, and where GeneCat has it without a MAG; also written to the mmt log |
 | `mmt help [command]` | help |
 
 Method, outputs and every column: [docs/MGScall.md](docs/MGScall.md), [docs/derep-ctg.md](docs/derep-ctg.md),
-[docs/ctg-meth.md](docs/ctg-meth.md).
+[docs/ctg-meth.md](docs/ctg-meth.md), [docs/export-mot.md](docs/export-mot.md).
 
 ## Install (HPC)
 
@@ -56,9 +57,13 @@ change says otherwise in `CHANGELOG.md` (then the next run redoes only what chan
 | samtools >= 1.15 | micromamba env (`MMT_SAMTOOLS`) |
 | DuckDB command-line binary (tested 1.1.3) | `MMT_DUCKDB` |
 | SMRT Link: `ipdSummary`, `ccs-kinetics-bystrandify`, `pbmm2`, `pbindex` | installed separately, `MMT_SMRT_BIN` = its `smrtcmds/bin` |
-| MATAFILER4 run + GeneCat MGS stage | `MMT_MAP` (the run's map), `MMT_GENECAT`; the run folder comes from the map's `#OutPath`/`#RunID` (or `-i`) |
+| MATAFILER4 run + GeneCat MGS stage | `--map` (the run's map, on every command line), `MMT_GENECAT`; the run folder comes from the map's `#OutPath`/`#RunID` (or `-i`) |
 
-The raw kinetics BAMs (with `fi/fp/ri/rp`) are found through the map: `#DirPath` + `SmplPrefix` + `.bam`.
+The raw kinetics BAMs (with `fi/fp/ri/rp`) are found through the map exactly as MATAFILER4 finds its input: in the
+`#DirPath` above the sample's row, the files named `<SmplPrefix>*.bam` (no SmplPrefix: every `.bam` in
+`#DirPath/Path`). The map is never taken from a config file. Before any work the index stops, naming the rows, unless
+every sample has exactly one such BAM of its own (none, several, or one BAM for two samples = stop), each sample is
+in the map once, and every BAM opens and carries kinetics (`fi` or `ip` in its first reads).
 
 ## Settings
 
@@ -145,6 +150,7 @@ lib/mmtpq.py        parquet schemas and writers of the per-sample tables
 lib/derep.py        derep-ctg engine (gene families, blocks, instances, lift, block sequences)
 lib/ctgmeth.py      ctg-meth engine (MAG references, junctions, windows, lift onto the blocks)
 lib/kinetics.sh     ipdSummary + pileup -> one kinetics table
+lib/motexport.py    export-mot engine (discovery, MAG FASTAs, CRAM -> molecules, mot table, catalog, QC)
 modules/            one file per command
 docs/               method and output description per command
 test/               synthetic MATAFILER4 run with known methylation + end-to-end test
@@ -163,3 +169,7 @@ kineticsTools `ipdSummary`; SMRT Link's other tools are replaced by small stand-
 samtools, minimap2 and a python >= 3.10 with pysam, pyarrow, pandas, edlib; ~1 min).
 `test/run_ctgmeth_test.sh WORKDIR` for `ctg-meth` (synthetic MATAFILER4 run with planted rearrangements, strain
 differences and conformation-specific methylation; same needs plus a kineticsTools `ipdSummary`).
+`test/run_motexport_test.sh WORKDIR` for `export-mot` (synthetic run: multi-contig and circular MAGs, three BAMs of one
+sample, a co-assembly, QC-flagged, split and low-MAPQ molecules, a missing BAM, Illumina / ONT / kinetics-free inputs,
+a contig changed after mapping; needs samtools and python with pysam, pyarrow, numpy; ~1 min). With `MOT_BIN=<mot>` it
+also runs `mot plan` on the tables (and on a broken one, which mot must refuse).
