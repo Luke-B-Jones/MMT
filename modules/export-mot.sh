@@ -12,7 +12,8 @@ Usage: mmt export-mot -i MF4_RUN -gc GENECAT -o OUT.tsv [options]
   -o, --out FILE       the mot input table to write; the library goes next to it: OUT.motlib/
 Options
   --map FILE           the run's map (default: the maps GeneCat was run with, LOGandSUB/GCmaps.ori, else its copies)
-  --binner TAG         GeneCat Bin_<TAG> (default: the only one there; several -> MMT_BINNER if it is one of them)
+  --binner TAG         GeneCat Bin_<TAG> (automatic only when exactly one exists; required for several)
+  --coverage-map TSV   optional sample/coverage[/format] paths for relocated MF4 depth (relative to TSV)
   --min-mapq N         primary MAPQ for a unique assignment [EXPORTMOT_MIN_MAPQ, 10]
   --exclude-qcfail     do not select molecules MATAFILER4 flagged QC-fail (0x200) (default: selected, flagged in
                        the catalog - mot filters alignments itself)
@@ -20,8 +21,9 @@ Options
   --config FILE        extra settings file
 
 What it writes
-  OUT.tsv              sample  bam  ref  role  reads  group - one row per sample x MAG x raw BAM with selected
-                       molecules; sample = <SmplID>__<MAG>, group = <SmplID>, reads = that BAM's molecules of that MAG
+  OUT.tsv              one row per final MAG x sample, including MGS, normalized_abundance and depth evidence;
+                       bam/reads are paired JSON arrays. mot_status=ready identifies callable rows.
+                       Requires the updated MOT reader; earlier MOT only accepts six columns / one BAM per row.
   OUT.motlib/          genomes/<MAG>.fa.gz (+ .fai .gzi): one FASTA per final MAG (MATAFILER4's own contigs)
                        assignments/<SmplID>/<MAG>/<BAM>.reads.txt.gz: movie/zmw, one per line (mot's read selection)
                        catalog/ mags.tsv contigs.tsv.gz samples.tsv bams.tsv molecules/<SmplID>.parquet (every
@@ -36,15 +38,16 @@ EOF
 }
 
 module_main() {
-    local TABLE="" BINNER="" MAPQ=${EXPORTMOT_MIN_MAPQ:-10} QCF="" lib rc=0
+    local TABLE="" BINNER="" COVERAGE="" MAPQ=${EXPORTMOT_MIN_MAPQ:-10} QCF="" lib rc=0
     while (( $# )); do
         case $1 in
-            -o|--out|-gc|--binner|--min-mapq) [[ $# -ge 2 && -n $2 ]] || usage_die "$1 needs a value" ;;
+            -o|--out|-gc|--binner|--min-mapq|--coverage-map) [[ $# -ge 2 && -n $2 ]] || usage_die "$1 needs a value" ;;
         esac
         case $1 in
             -o|--out)         TABLE=$2; shift 2; continue ;;      # a file here (common_opt's -o is a folder)
             -gc)              MMT_GENECAT=$2; shift 2; continue ;;
             --binner)         BINNER=$2; shift 2; continue ;;
+            --coverage-map)   COVERAGE=$2; shift 2; continue ;;
             --min-mapq)       MAPQ=$2; shift 2; continue ;;
             --exclude-qcfail) QCF=--exclude-qcfail; shift; continue ;;
             -h|--help)        module_help; exit 0 ;;
@@ -59,6 +62,7 @@ module_main() {
     [[ -n $TABLE ]] || usage_die "-o OUT.tsv is required (the mot input table to write)"
     [[ $MAPQ =~ ^[0-9]+$ ]] || usage_die "--min-mapq must be a number (got '$MAPQ')"
     [[ -z ${MMT_MAP:-} || -f $MMT_MAP ]] || die "map not found: $MMT_MAP"
+    [[ -z $COVERAGE || -f $COVERAGE ]] || die "coverage map not found: $COVERAGE"
     TABLE=$(abspath "$TABLE"); lib="${TABLE%.tsv}.motlib"
     mkdir -p "$lib" || die "cannot create $lib"
     if [[ -n ${MMT_ENV_PREFIX:-} ]]; then
@@ -73,7 +77,8 @@ module_main() {
     lock_take "$lib/.lock" || die "another export-mot writes $lib (lock $lib/.lock) - wait for it, or remove the lock if none runs"
     "$PYTHON" "$MMT_HOME/lib/motexport.py" --run "$(abspath "$MMT_MF4_RUN")" --genecat "$(abspath "$MMT_GENECAT")" \
         --table "$TABLE" ${MMT_MAP:+--map "$(abspath "$MMT_MAP")"} ${BINNER:+--binner "$BINNER"} \
-        --binner-default "$MMT_BINNER" --min-mapq "$MAPQ" $QCF --threads "$THREADS" --samtools "$SAMTOOLS" \
+        ${COVERAGE:+--coverage-map "$(abspath "$COVERAGE")"} \
+        --min-mapq "$MAPQ" $QCF --threads "$THREADS" --samtools "$SAMTOOLS" \
         --version "$(mmt_version)" || rc=$?
     lock_release "$lib/.lock"
     exit "$rc"

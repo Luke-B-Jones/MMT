@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # run_motexport_test.sh WORKDIR - end-to-end test of `mmt export-mot` on a synthetic MATAFILER4 run
 #   (test/motexport_mock.py). WORKDIR is wiped. Needs samtools on PATH and python with pysam, pyarrow, numpy
-#   (MMT_TEST_PY, default python3). With MOT_BIN (a mot binary) the tables are also checked by `mot plan`, mot's own
-#   validation of an input table (files, BAM headers, read-name lists, molecules in two samples). ~1 min.
+#   (MMT_TEST_PY, default python3). With MOT_BIN, a temporary six-column expansion is checked by older `mot plan`;
+#   the shipped schema-2 table itself requires an updated MOT reader. ~1 min.
 set -uo pipefail
 W=$(readlink -m "$1"); HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd); MMT="$HERE/../mmt"
 PY=${MMT_TEST_PY:-python3}
@@ -19,7 +19,17 @@ run() {   # run OUT.tsv ARGS... -> RC
 }
 mot_plan() {   # mot_plan TABLE -> 0 when mot accepts it
     [[ -n ${MOT_BIN:-} ]] || return 0
-    "$MOT_BIN" plan -i "$1" -q > "$1.motplan" 2>&1
+    "$PY" - "$1" "$1.legacy.tsv" <<'PY'
+import csv, json, sys
+with open(sys.argv[1]) as src, open(sys.argv[2], 'w') as out:
+    fields = ['sample', 'bam', 'ref', 'role', 'reads', 'group']
+    w = csv.DictWriter(out, fields, delimiter='\t', extrasaction='ignore', lineterminator='\n'); w.writeheader()
+    for r in csv.DictReader(src, delimiter='\t'):
+        if r['mot_status'] == 'ready':
+            for b, reads in zip(json.loads(r['bam']), json.loads(r['reads'])):
+                w.writerow(dict(r, bam=b, reads=reads))
+PY
+    "$MOT_BIN" plan -i "$1.legacy.tsv" -q > "$1.motplan" 2>&1
 }
 
 echo "== whole cohort (map from GeneCat's records): PARTIAL expected"
@@ -48,7 +58,6 @@ t "exit 0 (COMPLETE)" '(( RC == 0 ))'
 "$PY" "$HERE/check_motexport.py" "$M" "$W/clean/mot_input.tsv" clean | sed 's/^/  /'; t "checks (clean)" '(( PIPESTATUS[0] == 0 ))'
 if [[ -n ${MOT_BIN:-} ]]; then
     t "L: mot plan accepts the table (exit 0)" 'mot_plan "$W/clean/mot_input.tsv"'
-    t "L: mot plan lists every mot sample" '(( $(grep -c . <(cut -f1 "$W/clean/mot_input.tsv" | tail -n +2 | sort -u)) == 8 ))'
     # mot's read-name loader on every selection (ZmwSet::load via `mot plan -b ... -r ...` is per sample; the table
     # check above already loaded each reads file once)
 fi
@@ -60,11 +69,33 @@ t "exit 3" '(( RC == 3 ))'
 
 echo "== a broken table is refused by mot (the test can fail)"
 if [[ -n ${MOT_BIN:-} ]]; then
-    # row 3 gets row 2's BAM and a copy of row 2's selection (another file, the same molecules)
-    cp "$(awk -F'\t' 'NR == 2 {print $5}' "$W/clean/mot_input.tsv")" "$W/copy.reads.txt.gz"
-    awk -F'\t' -v OFS='\t' -v c="$W/copy.reads.txt.gz" 'NR == 2 {b = $2} NR == 3 {$2 = b; $5 = c} 1' \
-        "$W/clean/mot_input.tsv" > "$W/bad.tsv"
+    "$PY" - "$W/clean/mot_input.tsv" "$W/bad.tsv" <<'PY'
+import csv, json, sys
+with open(sys.argv[1]) as src:
+    rows = list(csv.DictReader(src, delimiter='\t')); fields = list(rows[0])
+active = [r for r in rows if r['mot_status'] == 'ready']
+active[1]['bam'], active[1]['reads'] = active[0]['bam'], active[0]['reads']
+with open(sys.argv[2], 'w') as out:
+    w = csv.DictWriter(out, fields, delimiter='\t', lineterminator='\n'); w.writeheader(); w.writerows(rows)
+PY
     t "L (negative): two samples selecting the same molecules of one BAM -> mot plan refuses" '[[ -s $W/bad.tsv ]] && ! mot_plan "$W/bad.tsv" && grep -q "same molecules" "$W/bad.tsv.motplan"'
 fi
+echo "== missing coverage stays NA and PARTIAL; molecule selections remain usable"
+mv "$M/mf4/run/S1/mapping/S1-smd.bam.coverage.gz" "$M/S1.depth.gz"
+run "$W/missing/mot_input.tsv" --map "$M/map_clean.txt"
+t "missing depth -> PARTIAL" '(( RC == 3 ))'
+"$PY" - "$W/missing/mot_input.tsv" <<'PY'
+import csv, sys
+rows = list(csv.DictReader(open(sys.argv[1]), delimiter='\t'))
+r = next(r for r in rows if r['group'] == 'S1' and r['MAG'] == 'S1__SemiBin_1')
+assert r['normalized_abundance'] == 'NA' and r['abundance_status'] == 'unavailable'
+assert r['mot_status'] == 'ready'
+PY
+t "missing depth never becomes zero" '(( $? == 0 ))'
+printf 'sample\tcoverage\nS1\tS1.depth.gz\n' > "$M/coverage.tsv"
+run "$W/override/mot_input.tsv" --map "$M/map_clean.txt" --coverage-map "$M/coverage.tsv"
+t "explicit relative coverage override restores COMPLETE" '(( RC == 0 ))'
+"$PY" -m unittest discover -s "$HERE" -p test_motabundance.py -q
+t "analytical abundance tests" '(( $? == 0 ))'
 echo "$NP passed, $NF failed"
 exit $(( NF > 0 ))

@@ -139,6 +139,21 @@ class Cram:
             sam += f"{q}\t{flag}\t{c}\t{pos}\t{mq}\t{cig}\t*\t0\t0\t{sq}\t*\n"
         subprocess.run(["samtools", "sort", "-O", "cram", "--reference", ref, "-o", f"{d}/{self.s}-smd.cram", "-"],
                        input=sam, text=True, check=True)
+        # MF4's full-depth track, including zero-depth and non-final-MAG contigs.
+        depth = subprocess.run(["samtools", "depth", "-aa", "--reference", ref, f"{d}/{self.s}-smd.cram"],
+                               text=True, capture_output=True, check=True).stdout
+        with gzip.open(f"{d}/{self.s}-smd.bam.coverage.gz", "wt") as out:
+            old = None
+            for line in depth.splitlines():
+                c, p, v = line.split("\t"); p, v = int(p), int(v)
+                if old and old[0] == c and old[2] == p - 1 and old[3] == v:
+                    old[2] = p
+                else:
+                    if old:
+                        out.write("\t".join(map(str, old)) + "\n")
+                    old = [c, p - 1, p, v]
+            if old:
+                out.write("\t".join(map(str, old)) + "\n")
         os.remove(ref); os.remove(ref + ".fai")
         open(f"{d}/{self.s}-smd.cram.retained.size", "w").write("1000\n")
 

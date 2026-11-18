@@ -55,6 +55,8 @@ def bin_contigs(mags, alias, sample_asm, binner):
         if not info["asm"]:
             info["status"] = "no_assembly"; continue
         binfile = os.path.join(info["asm"], "Binning", binner, s)
+        if not os.path.isfile(binfile) and os.path.isfile(binfile + ".gz"):
+            binfile += ".gz"
         by_binfile[binfile].setdefault(m.group(2), []).append(mag)
     for binfile, bins in by_binfile.items():
         if not os.path.isfile(binfile):
@@ -62,7 +64,7 @@ def bin_contigs(mags, alias, sample_asm, binner):
                 for mag in ms:
                     mag_info[mag]["status"] = "no_bin_file"
             continue
-        with open(binfile) as fh:
+        with opener(binfile) as fh:
             for line in fh:
                 f = line.rstrip("\n").split("\t")
                 if len(f) < 2 or f[0] == "Sequence ID" or f[1] not in bins:

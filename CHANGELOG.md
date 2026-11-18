@@ -5,6 +5,24 @@ the mmt log). A change that alters results also bumps the command's method versi
 `modules/MGScall.sh`, `DEREP_METHOD` in `modules/derep-ctg.sh`, `CTGMETH_METHOD` / `LIFT_METHOD` in
 `modules/ctg-meth.sh`, `ASSIGN_METHOD` in `lib/reads.sh`), so the next run redoes them.
 
+## 0.9.0 - 2026-11-18
+
+- `export-mot` schema 2: **one table, exactly one row per final MAG x sample**, with MAG, MGS, binner, normalized
+  abundance, raw depth/breadth/SD, mapped-base fraction, denominator, source and availability/callability statuses.
+  BAM/read-selection cells are paired JSON arrays, including singleton arrays; no duplicate abundance per BAM.
+  Unprofiled/missing pairs are `NA`, not inferred zero. **MOT's reader must be updated**; the older six-column reader
+  is not compatible. The reader contract and normalization are in docs/export-mot.md.
+- Abundance is length-weighted MAG coverage per Gbp contributing to the sample's full assembly depth (unbinned
+  contigs included). It is neither biological absolute abundance nor a genome-equivalent fraction. Sample-specific
+  full-depth tracks are validated against all assembly contigs; sample contig-mean fallback retains its rounding
+  and leaves breadth/SD unavailable. Evidence is cached independently from molecule selections.
+- `--coverage-map TSV` explicitly locates relocated/future MF4 depth outputs; bounded discovery never borrows
+  co-assembly pooled, support-library or another sample's depth. `--binner` is required when several binners exist.
+  Plain/gzipped MAGvsGC and bin membership supported; MAG/MGS read by named columns; conflicting MGS labels fail.
+- Existing molecule-assignment tests retained through per-BAM expansion; new analytical tests cover unequal contig
+  lengths, unbinned denominator, depth invariance, zero vs unavailable, stale/truncated coverage, shared contigs,
+  explicit discovery overrides and binner ambiguity. Export method 2; cached input stamps use nanosecond mtimes.
+
 ## 0.8.0 - 2026-11-17
 
 - **`mmt export-mot -i RUN -gc GENECAT -o OUT.tsv`** - a Methyl-o-Type input table for the whole run, plus a library

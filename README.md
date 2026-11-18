@@ -15,7 +15,7 @@ Version: see `VERSION` and `CHANGELOG.md`. `mmt version` also prints the git com
 | `mmt MGScall --mag-mag` | each MAG's reads on that MAG's own contigs (not the representative) |
 | `mmt derep-ctg` | per MGS: a short list of collinear blocks ("dereplicated contigs") from all its MAGs, with every occurrence in every MAG down to the base (lift table), block sequences, block order along the contigs, genes, gene families and the MAG contig sequences (old name `dereplicate-contigs` still works) |
 | `mmt ctg-meth` | per MGS x sample: every MAG's own contigs -> m6A / m4C per site, placed on the derep-ctg blocks; plus read sets per junction (other conformations of a contig, and the as-assembled one at the same breakpoint) with their own calls on the junction flanks |
-| `mmt export-mot` | the whole run as one Methyl-o-Type (mot) input table: one FASTA per final MAG, per sample x MAG x raw BAM the molecules MATAFILER4 aligned to that MAG (QC-flagged ones included), a molecule catalog and QC (`-i RUN -gc GENECAT -o OUT.tsv`; no `--map` needed) |
+| `mmt export-mot` | one table with every MAG x sample, MGS identity, normalized abundance and paired JSON BAM/read-selection lists; MAG FASTAs, molecule catalog and QC (`-i RUN -gc GENECAT -o OUT.tsv`; `--binner` required if ambiguous). Schema 2 requires an updated MOT reader. |
 | `mmt check` | settings in effect, tool and input checks; with `-o OUT` also builds the index and reports usable samples / MGS |
 | `mmt status -o OUT` | per MGS and command: the samples it is planned for and their state (done / linked / not yet ...), with names, and where GeneCat has it without a MAG; also written to the mmt log |
 | `mmt help [command]` | help |
@@ -172,4 +172,5 @@ differences and conformation-specific methylation; same needs plus a kineticsToo
 `test/run_motexport_test.sh WORKDIR` for `export-mot` (synthetic run: multi-contig and circular MAGs, three BAMs of one
 sample, a co-assembly, QC-flagged, split and low-MAPQ molecules, a missing BAM, Illumina / ONT / kinetics-free inputs,
 a contig changed after mapping; needs samtools and python with pysam, pyarrow, numpy; ~1 min). With `MOT_BIN=<mot>` it
-also runs `mot plan` on the tables (and on a broken one, which mot must refuse).
+also runs `mot plan` on temporary six-column expansions (and on a broken one, which mot must refuse).
+The actual schema-2 table needs the updated MOT reader; its contract is in `docs/export-mot.md`.
