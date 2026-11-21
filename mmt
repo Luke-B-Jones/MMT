@@ -25,8 +25,8 @@ Commands
               (also: dereplicate-contigs, derep)
   ctg-meth  methylation of every MAG's own contigs per sample, lifted onto the derep-ctg blocks, with read
               sets per junction (conformation) of a contig
-  export-mot  one table of every MAG x sample: MGS, normalized abundance and paired BAM/read-selection lists;
-              one FASTA per final MAG, molecule catalog and QC (-i RUN -gc GENECAT -o OUT.tsv)
+  export-mot  a Methyl-o-Type (mot) input table from the whole run: one FASTA per final MAG, per sample x MAG x raw
+              BAM the molecules MATAFILER4 aligned to that MAG, a molecule catalog and QC (-i RUN -gc GENECAT -o OUT.tsv)
   check     show the settings in effect, check tools and inputs (with -o: build / refresh the index)
   status    what is done per MGS in an output folder: per sample done / linked / not yet ... (also into the mmt log)
   version   print the version (and git commit)

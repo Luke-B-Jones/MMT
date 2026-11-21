@@ -88,6 +88,18 @@ with gzip.open(f"{GC}/Bin_SB/MAGvsGC.txt.gz", "wt") as o:
     o.write("MAG\tMGS\tRepresentative4MGS\tCompleteness\tContamination\n")
     for m, g, st in mvg:
         o.write(f"{m}\t{g}\t{st}\t91.0\t1.5\n")
+# GeneCat's MGS abundance (R-style matrix, MGS x samples, header one field short): the table's abundance column.
+# MGS.3 has no value > 0 anywhere (S3__SemiBin_3 -> '.'); MGS "?" (S2__SemiBin_2) has no row (-> '.').
+ab_samples = [f"S{i}" for i in range(1, 11)]
+ab = {("S1", "MGS.0"): "0.31", ("S3", "MGS.0"): "0.12", ("S2", "MGS.1"): "0.22", ("S4", "MGS.1"): "0.05",
+      ("S5", "MGS.1"): "0.07", ("S3", "MGS.2"): "0.4", ("S6", "MGS.4"): "0.1", ("S10", "MGS.5"): "0.2"}
+os.makedirs(f"{GC}/Bin_SB/Annotation/Abundance")
+with open(f"{GC}/Bin_SB/Annotation/Abundance/MGS.matL0.txt", "w") as o:
+    o.write("\t".join(ab_samples) + "\n")
+    for g in ("MGS.0", "MGS.1", "MGS.2", "MGS.3", "MGS.4", "MGS.5"):
+        o.write(g + "".join(f"\t{ab.get((s, g), '0')}" for s in ab_samples) + "\n")
+truth["abundance"] = {f"{s}|{g}": v for (s, g), v in ab.items()}
+truth["mgs"] = {m: ("" if g == "?" else g) for m, g, _ in mvg}
 for m, g, a, b in (("S1__SemiBin_1", "MGS.0", "S1", "SemiBin_1"), ("S2__SemiBin_1", "MGS.1", "S2", "SemiBin_1")):
     with gzip.open(f"{GC}/Bin_SB/Genomes/MGS_ctg/{g}.ctgs.{m}.fna.gz", "wt") as o:
         for c, s, bb in asm[a][1]:
@@ -139,21 +151,6 @@ class Cram:
             sam += f"{q}\t{flag}\t{c}\t{pos}\t{mq}\t{cig}\t*\t0\t0\t{sq}\t*\n"
         subprocess.run(["samtools", "sort", "-O", "cram", "--reference", ref, "-o", f"{d}/{self.s}-smd.cram", "-"],
                        input=sam, text=True, check=True)
-        # MF4's full-depth track, including zero-depth and non-final-MAG contigs.
-        depth = subprocess.run(["samtools", "depth", "-aa", "--reference", ref, f"{d}/{self.s}-smd.cram"],
-                               text=True, capture_output=True, check=True).stdout
-        with gzip.open(f"{d}/{self.s}-smd.bam.coverage.gz", "wt") as out:
-            old = None
-            for line in depth.splitlines():
-                c, p, v = line.split("\t"); p, v = int(p), int(v)
-                if old and old[0] == c and old[2] == p - 1 and old[3] == v:
-                    old[2] = p
-                else:
-                    if old:
-                        out.write("\t".join(map(str, old)) + "\n")
-                    old = [c, p - 1, p, v]
-            if old:
-                out.write("\t".join(map(str, old)) + "\n")
         os.remove(ref); os.remove(ref + ".fai")
         open(f"{d}/{self.s}-smd.cram.retained.size", "w").write("1000\n")
 

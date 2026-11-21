@@ -20,26 +20,7 @@ def t(name, ok, detail=""):
 
 rows = [l.rstrip("\n").split("\t") for l in open(table)]
 head, rows = rows[0], [dict(zip(rows[0], r)) for r in rows[1:]]
-t("table has MAG, MGS, normalized abundance and provenance", {"sample", "bam", "ref", "role", "reads", "group",
-  "MAG", "MGS", "normalized_abundance", "abundance_unit", "abundance_status", "coverage_source", "mot_status"} <= set(head))
-public = rows
-t("exactly one row per MAG x sample", len({(r["group"], r["MAG"]) for r in public}) == len(public))
-t("every MAG x sample combination included", len(public) == len({r["group"] for r in public}) * len(T["mags"]))
-t("unprofiled pairs have NA abundance, not zero", all(r["normalized_abundance"] == "NA" for r in public
-  if r["abundance_status"] == "not_profiled") and any(r["abundance_status"] == "not_profiled" for r in public))
-t("MGS identity is present on every MAG row", all(r["MGS"] for r in public))
-t("all BAM/read cells are paired JSON arrays", all(isinstance(json.loads(r["bam"]), list)
-  and len(json.loads(r["bam"])) == len(json.loads(r["reads"])) for r in public))
-if mode != "clean":
-    r = next(r for r in public if r["group"] == "S10" and r["MAG"] == "S10__SemiBin_1")
-    t("stale coverage against changed reference is unavailable", r["normalized_abundance"] == "NA")
-# Expand only callable rows to apply the original per-BAM assignment truth checks.
-rows = [dict(r, bam=b, reads=f) for r in public if r["mot_status"] == "ready"
-        for b, f in zip(json.loads(r["bam"]), json.loads(r["reads"]))]
-for r in public:
-    if r["abundance_status"] == "ok":
-        expected = float(r["mag_mean_depth"]) * 1e9 / float(r["sample_mapped_bases"])
-        t(f"abundance formula {r['group']} {r['MAG']}", abs(float(r["normalized_abundance"]) - expected) < 1e-6)
+t("table header = mot 0.7 columns", head == ["sample", "genome", "bam", "reads", "ref", "mgs", "abundance", "role"], head)
 reads = {r["reads"]: gzip.open(r["reads"], "rt").read().split("\n")[:-1] for r in rows}
 man = json.load(open(f"{lib}/manifest.json"))
 want_status = {"full": "PARTIAL", "noqc": "PARTIAL", "clean": "COMPLETE"}[mode]
@@ -65,7 +46,7 @@ def fa(path):
 
 
 def got(s, mag, lab):
-    r = [x for x in rows if x["group"] == s and x["reads"].endswith(f"/{lab}.reads.txt.gz")
+    r = [x for x in rows if x["sample"] == s and x["reads"].endswith(f"/{lab}.reads.txt.gz")
          and os.path.basename(os.path.dirname(x["reads"])) == mags[mag]["file"]]
     return reads[r[0]["reads"]] if r else []
 
@@ -78,8 +59,9 @@ for k, v in sorted(truth_sel.items()):
 t("no row beyond the truth", len(rows) == len(truth_sel), (len(rows), len(truth_sel)))
 
 # A simple sample
-r1 = [r for r in rows if r["group"] == "S1"]
-t("A: S1 has one row (one BAM, one MAG) named S1__S1__SemiBin_1", [r["sample"] for r in r1] == ["S1__S1__SemiBin_1"])
+r1 = [r for r in rows if r["sample"] == "S1"]
+t("A: S1 has one row (one BAM, one MAG): sample S1, genome S1__SemiBin_1",
+  [(r["sample"], r["genome"]) for r in r1] == [("S1", "S1__SemiBin_1")])
 t("A: S1's BAM resolved through the map (input_raw.txt names a moved file)",
   r1 and r1[0]["bam"].endswith("/raw/c1/S1.hifi_reads.bam"))
 # B multi-contig MAG ; C circular
@@ -95,26 +77,34 @@ t("C: circular contig exported as in the assembly (no added overlap), flagged ci
   f4 == {"S2__C4": src["S2__C4"]} and ["S2__SemiBin_2", "S2__C4"] == [c[0] for c in circ if c[1] == "S2__C4"] + ["S2__C4"]
   and [c[5].strip() for c in circ if c[1] == "S2__C4"] == ["1"] and mags["S2__SemiBin_2"]["n_circular"] == "1")
 t("C: MAG without MGS ('?') is exported too", mags["S2__SemiBin_2"]["status"] == "ok" and mags["S2__SemiBin_2"]["MGS"] == "")
-t("C: unclustered MAG carries ? in the public MGS column", all(r["MGS"] == "?" for r in public
-  if r["MAG"] == "S2__SemiBin_2"))
 t("C: contig md5 in the catalog = md5 of the sequence", all(
     c[4] == hashlib.md5(src[c[1]].upper().encode()).hexdigest() for c in circ[1:] if c[1].startswith("S2__")))
 # D three BAMs, one sample x MAG
-r3 = [r for r in rows if r["group"] == "S3" and "SemiBin_1" in r["sample"]]
-t("D: S3 x SemiBin_1 = 3 rows, one per BAM, same sample name and same ref",
-  len(r3) == 3 and len({r["sample"] for r in r3}) == 1 and len({r["ref"] for r in r3}) == 1
-  and len({r["bam"] for r in r3}) == 3)
+r3 = [r for r in rows if r["sample"] == "S3" and r["genome"] == "S3__SemiBin_1"]
+t("D: S3 x SemiBin_1 = 3 rows (one unit), one per BAM, same ref, mgs and abundance",
+  len(r3) == 3 and len({(r["ref"], r["mgs"], r["abundance"]) for r in r3}) == 1 and len({r["bam"] for r in r3}) == 3)
 t("D: each row's molecules are of its own BAM's movie", all(
     {x.split("/")[0] for x in reads[r["reads"]]} == {pysam.AlignmentFile(r["bam"], check_sq=False).header.to_dict()["RG"][0]["PU"]}
     for r in r3))
-t("D: three BAMs occupy ONE public MAG x sample row", len([r for r in public if r["group"] == "S3"
-  and r["MAG"] == "S3__SemiBin_1"]) == 1 and len(json.loads(next(r["bam"] for r in public
-  if r["group"] == "S3" and r["MAG"] == "S3__SemiBin_1"))) == 3)
 # E co-assembly
-r45 = [r for r in rows if r["group"] in ("S4", "S5")]
-t("E: co-assembled S4 and S5 -> two mot samples on one MAG FASTA, each with its own BAM",
-  sorted(r["sample"] for r in r45) == ["S4__S5M2__SemiBin_1", "S5__S5M2__SemiBin_1"]
+r45 = [r for r in rows if r["sample"] in ("S4", "S5")]
+t("E: co-assembled S4 and S5 -> two mot samples with the same genome on one MAG FASTA, each with its own BAM",
+  sorted((r["sample"], r["genome"]) for r in r45) == [("S4", "S5M2__SemiBin_1"), ("S5", "S5M2__SemiBin_1")]
   and len({r["ref"] for r in r45}) == 1 and len({r["bam"] for r in r45}) == 2)
+# mgs and abundance: the MAG's MGS ('.' for '?'); GeneCat's value for (sample, MGS), '.' where it has none > 0
+mag_of = {mags[m]["file"]: m for m in mags}
+want = [(r["mgs"], r["abundance"], T["mgs"][mag_of[r["genome"]]] or ".",
+         T["abundance"].get(f"{r['sample']}|{T['mgs'][mag_of[r['genome']]]}", ".") if T["mgs"][mag_of[r["genome"]]] else ".")
+        for r in rows]
+t("mgs = the MAG's MGS ('.' without one), abundance = GeneCat's value ('.' without one), every row",
+  all(a == c and b == d for a, b, c, d in want), [w for w in want if w[0] != w[2] or w[1] != w[3]][:3])
+t("abundance: S1 0.31 (MGS.0), S2__SemiBin_2 '.' (no MGS), S3__SemiBin_3 '.' (MGS.3 absent in GeneCat's table)",
+  [r["abundance"] for r in rows if r["genome"] == "S1__SemiBin_1"] == ["0.31"]
+  and {r["abundance"] for r in rows if r["genome"] in ("S2__SemiBin_2", "S3__SemiBin_3")} <= {"."}
+  and any(r["genome"] == "S2__SemiBin_2" for r in rows))
+t("one sample per SmplID: S3's MAGs share the sample name, distinct genomes",
+  {r["genome"] for r in rows if r["sample"] == "S3"} >= {"S3__SemiBin_1"} and
+  all(r["genome"].startswith(("S3__",)) for r in rows if r["sample"] == "S3"))
 if mode != "clean":
     # F QC-flagged alignments kept with their status
     qc = {k[1]: v for k, v in cat.items() if k[0] == "S1"}
@@ -144,13 +134,13 @@ if mode != "clean":
     t("H: no molecule twice in the selections of one BAM", len(allsel) == len(set(allsel)))
     un = open(f"{lib}/qc/unresolved.tsv").read()
     # I missing BAM ; J other technologies ; K changed reference
-    t("I: S6 (no raw BAM) reported, no row", "S6\t" in un and not [r for r in rows if r["group"] == "S6"])
+    t("I: S6 (no raw BAM) reported, no row", "S6\t" in un and not [r for r in rows if r["sample"] == "S6"])
     t("I: S6 molecules in the catalog with bam_status movie_not_in_bams",
       all(v["bam_status"] == "movie_not_in_bams" for k, v in cat.items() if k[0] == "S6") and any(k[0] == "S6" for k in cat))
     t("J: Illumina (S7) and ONT (S8) reads: no row, not reported as a problem, no molecule in the catalog",
-      not [r for r in rows if r["group"] in ("S7", "S8")] and "S7\t" not in un and "S8\t" not in un
+      not [r for r in rows if r["sample"] in ("S7", "S8")] and "S7\t" not in un and "S8\t" not in un
       and not any(k[0] in ("S7", "S8") for k in cat))
-    t("J: PacBio BAM without kinetics (S9) reported, no row", "S9\t" in un and not [r for r in rows if r["group"] == "S9"])
+    t("J: PacBio BAM without kinetics (S9) reported, no row", "S9\t" in un and not [r for r in rows if r["sample"] == "S9"])
     t("K: S10 contig changed after mapping -> reported, its molecules reference_mismatch, never selected",
       "S10\t" in un and all(not v["selected"] for k, v in cat.items() if k[0] == "S10" and v["status"] == "reference_mismatch"))
     smp = {l.split("\t")[0]: l.rstrip("\n").split("\t") for l in open(f"{lib}/catalog/samples.tsv")}

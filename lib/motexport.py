@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""mmt export-mot: MF4 + GeneCat -> schema-2 MAG x sample table with MGS, abundance and BAM/read JSON lists.
+"""mmt export-mot: a finished MATAFILER4 run + its GeneCat MGS stage -> a Methyl-o-Type (mot) input table + library.
 
   python3 motexport.py --run MF4_RUN --genecat GC --table OUT.tsv [--map MAP] [--binner TAG] [--min-mapq N]
-                       [--coverage-map TSV] [--exclude-qcfail] [--threads N] [--samtools PATH]
+                       [--exclude-qcfail] [--abundance FILE] [--threads N] [--samtools PATH]
 
-Every final MAG x run sample pair has one row. Call mot_status=ready rows with a schema-2 MOT reader;
-older MOT rejects the added columns and JSON-array BAM/read cells. Unprofiled abundance is NA, never zero.
+The table is mot 0.7's input table (mot help input): sample genome bam reads ref mgs abundance role, one row per
+sample x MAG x raw BAM; sample = the SmplID, genome = the MAG, mgs = its MGS, abundance = GeneCat's MGS abundance.
 
 What is used (the rules of GeneCat's and MATAFILER4's own code; see docs/export-mot.md):
   maps         --map, else the maps GeneCat was run with (<GC>/LOGandSUB/GCmaps.ori), else GeneCat's copies
@@ -39,15 +39,15 @@ import sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mf4                                                                     # noqa: E402
-import motabundance                                                            # noqa: E402
 
-METHOD = 2          # export schema: one MAG x sample row, BAM/read JSON arrays, abundance
+METHOD = 1          # bump when per-sample outputs change -> every sample is redone on the next run
 STATUS = ["unique", "ambiguous_low_mapq", "split_across_mags", "split_mag_unbinned", "contig_in_two_mags",
           "reference_mismatch", "no_primary"]
 BAMST = ["ok", "movie_not_in_bams", "movie_in_two_bams", "not_pacbio_name", "bam_not_mot_ready"]
 MOVIE_RE = re.compile(r"^m\d+[A-Za-z]?_\d{6}_\d{6}(_s\d+)?$")   # PacBio movie (RS II, Sequel, Revio)
 SAFE = re.compile(r"[^A-Za-z0-9._-]")
-MOT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")       # mot's sample-name rule (src/inputs.cpp)
+MOT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")       # mot's sample / genome name rule (src/inputs.cpp)
+MOT_COLUMNS = ["sample", "genome", "bam", "reads", "ref", "mgs", "abundance", "role"]   # mot 0.7 input table
 OFF, BAD, SHARED = -1, -2, -3                                      # contig codes besides a MAG index
 
 
@@ -62,13 +62,26 @@ def md5s(*parts):
 def stamp(p):
     try:
         st = os.stat(p)
-        return f"{st.st_size}:{st.st_mtime_ns}"
+        return f"{st.st_size}:{int(st.st_mtime)}"
     except OSError:
         return "missing"
 
 
 def safe(name):
     return SAFE.sub("_", name)
+
+
+def mot_name(name):      # a mot sample / genome name (it names an output folder): safe characters, <= 100 (cut + checksum)
+    s = safe(name)
+    return s if len(s) <= 100 else f"{s[:91]}_{md5s(name)[:8]}"
+
+
+def num(x):              # a finite number, else NaN (every comparison with NaN is False)
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return float("nan")
+    return v if v == v and v not in (float("inf"), float("-inf")) else float("nan")
 
 
 def stem(mag):           # SemiBin MAG names end in .fa.gz: file and sample names without it
@@ -84,17 +97,8 @@ def write_atomic(path, text):
 
 
 def tsv(path, head, rows):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.{os.getpid()}.tmp"
-    try:
-        with open(tmp, "w") as o:
-            o.write("\t".join(head) + "\n")
-            for r in rows:
-                o.write("\t".join("NA" if x is None else str(x) for x in r) + "\n")
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
+    write_atomic(path, "\t".join(head) + "\n" + "".join("\t".join("" if x is None else str(x) for x in r) + "\n"
+                                                         for r in rows))
 
 
 def gz_lines(path, lines):          # deterministic gzip (mtime 0): a rerun gives the same bytes
@@ -108,16 +112,10 @@ def kits(chem):                     # mot's same_chemistry: binding kit + sequen
     return tuple(chem.split("/")[:2])
 
 
-def mot_name(sample, mag):
-    name = f"{sample}__{mag['stem']}"
-    return safe(name) if len(safe(name)) <= 100 else f"{safe(name)[:91]}_{md5s(name)[:8]}"
-
-
 # ============================================================================ discovery
-def find_binner(gc, explicit):
+def find_binner(gc, explicit, default):
     have = sorted(d[4:] for d in os.listdir(gc)
-                  if d.startswith("Bin_") and any(os.path.isfile(os.path.join(gc, d, f))
-                                                   for f in ("MAGvsGC.txt.gz", "MAGvsGC.txt")))
+                  if d.startswith("Bin_") and os.path.isfile(os.path.join(gc, d, "MAGvsGC.txt.gz")))
     if explicit:
         if explicit not in have:
             mf4.stop(f"--binner {explicit}: no {gc}/Bin_{explicit}/MAGvsGC.txt.gz (found: {', '.join(have) or 'none'})")
@@ -126,13 +124,9 @@ def find_binner(gc, explicit):
         return have[0]
     if not have:
         mf4.stop(f"no Bin_<binner>/MAGvsGC.txt.gz in {gc} - is this the GeneCat folder and has its MGS stage finished?")
-    mf4.stop(f"several binners in {gc} ({', '.join(have)}): choose one explicitly with --binner "
-             "(the configured default is not used to guess)")
-
-
-def mag_table(gc, binner):
-    base = os.path.join(gc, f"Bin_{binner}", "MAGvsGC.txt")
-    return base + ".gz" if os.path.isfile(base + ".gz") else base
+    if default in have:
+        return default
+    mf4.stop(f"several binners in {gc} ({', '.join(have)}): choose one with --binner")
 
 
 def find_maps(gc, override):
@@ -219,7 +213,7 @@ def discover(a):
     rep_lines, fatal = [], []
     report = rep_lines.append
     run, gc = os.path.abspath(a.run), os.path.abspath(a.genecat)
-    binner = find_binner(gc, a.binner)
+    binner = find_binner(gc, a.binner, a.binner_default)
     maps, map_src = find_maps(gc, a.map)
     report(f"binner Bin_{binner} ; maps: {', '.join(maps)} ({map_src})")
 
@@ -245,8 +239,7 @@ def discover(a):
         if not os.path.isdir(sd):
             not_in_run.append(s); continue
         at = os.path.join(sd, "assemblies", "metag", "assembly.txt")
-        pointer = mf4.first_line(at) if os.path.isfile(at) else ""
-        asm = os.path.realpath(os.path.join(os.path.dirname(at), pointer)) if pointer else ""
+        asm = os.path.normpath(mf4.first_line(at)) if os.path.isfile(at) and mf4.first_line(at) else ""
         bams, prov, notes, others = choose_bams(s, run, r["bams"], probe)
         if r["problem"]:
             notes.append(r["problem"])
@@ -270,23 +263,18 @@ def discover(a):
                     if not b["kinetics"] else f"READTYPE {b['read_types']} (mot needs CCS / HiFi)"))
 
     # ---- final MAGs (MAGvsGC, non-canopy) and their contigs
-    mvg = mag_table(gc, binner)
+    mvg = os.path.join(gc, f"Bin_{binner}", "MAGvsGC.txt.gz")
     mags, qual, rep, seen_mag = collections.OrderedDict(), {}, {}, collections.Counter()
-    with mf4.opener(mvg) as fh:
-        hd = fh.readline().rstrip("\r\n").split("\t")
-        if not {"MAG", "MGS"} <= set(hd) or len(set(hd)) != len(hd):
-            mf4.stop(f"{mvg}: requires unique MAG and MGS header columns")
-        im, ig = hd.index("MAG"), hd.index("MGS")
+    with gzip.open(mvg, "rt") as fh:
+        hd = fh.readline().rstrip("\n").split("\t")
         ir = hd.index("Representative4MGS") if "Representative4MGS" in hd else None
         ic = hd.index("Completeness") if "Completeness" in hd else None
         ix = hd.index("Contamination") if "Contamination" in hd else None
         for line in fh:
-            f = line.rstrip("\r\n").split("\t")
-            if len(f) <= max(im, ig) or f[im].startswith("Cano__"):
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 2 or f[0].startswith("Cano__"):
                 continue
-            mag, mgs = f[im], f[ig] if f[ig] not in ("?", "") else ""
-            if mag in mags and mags[mag] != mgs:
-                fatal.append(f"MAG {mag} has conflicting MGS identities in {mvg}")
+            mag, mgs = f[0], f[1] if f[1] not in ("?", "") else ""
             seen_mag[mag] += 1
             if mgs and ((ir is not None and ir < len(f) and f[ir] == "*") or mgs not in rep):
                 rep[mgs] = mag
@@ -297,7 +285,7 @@ def discover(a):
         report(f"MAGvsGC lists {len(dup)} MAG(s) more than once (one MAG each kept): {', '.join(dup[:5])}")
     info, _ = mf4.bin_contigs(mags, alias, {s: v["asm"] for s, v in samples.items()}, binner)
     for m, i in info.items():
-        i.update(id=m, is_rep=int(bool(i["MGS"]) and rep.get(i["MGS"]) == m), completeness=qual[m][0],
+        i.update(is_rep=int(bool(i["MGS"]) and rep.get(i["MGS"]) == m), completeness=qual[m][0],
                  contamination=qual[m][1], stem=stem(m))
     # contigs claimed by two MAGs of one assembly
     owner = collections.defaultdict(list)
@@ -439,8 +427,8 @@ def sample_job(job):
               cram_has_m5=False)
     env = dict(os.environ, REF_PATH="/nonexistent/mmt", REF_CACHE="/nonexistent/mmt")
     p = subprocess.Popen([job["samtools"], "view", "-h", "--no-PG", "-F", "0x4", "--input-fmt-option",
-                          "required_fields=0x1f", job["cram"]], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, bufsize=1 << 20, env=env)
+                          "required_fields=31", job["cram"]], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, bufsize=1 << 20, env=env)     # required_fields 31 = 0x1f: newer htslib rejects hex
     code, ctg_names, cidx = {}, [], {}              # CRAM contig -> MAG code / OFF / BAD / SHARED ; -> index
     movies, mv_idx = [], {}
     K, C, Q, F, P, I = (array.array(t) for t in ("q", "i", "B", "H", "I", "i"))
@@ -620,11 +608,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run", required=True); ap.add_argument("--genecat", required=True)
     ap.add_argument("--table", required=True); ap.add_argument("--map", default="")
-    ap.add_argument("--binner", default="")
+    ap.add_argument("--binner", default=""); ap.add_argument("--binner-default", default="SB")
     ap.add_argument("--min-mapq", type=int, default=10); ap.add_argument("--exclude-qcfail", action="store_true")
     ap.add_argument("--threads", type=int, default=4); ap.add_argument("--samtools", default="samtools")
+    ap.add_argument("--abundance", default="")                   # default <GC>/Bin_<binner>/Annotation/Abundance/MGS.matL0.txt
     ap.add_argument("--version", default="")
-    ap.add_argument("--coverage-map", default="", help="TSV sample/coverage[/format] overrides for relocated MF4 depth")
     a = ap.parse_args()
     t_start = time.time()
     table = os.path.abspath(a.table)
@@ -635,11 +623,20 @@ def main():
         log(line)
     if D["fatal"]:
         mf4.stop(" | ".join(D["fatal"]))
+    # GeneCat's MGS abundance (MGS x samples): the table's abundance column
+    D["abundance_path"] = os.path.abspath(a.abundance) if a.abundance else \
+        os.path.join(D["gc"], f"Bin_{D['binner']}", "Annotation", "Abundance", "MGS.matL0.txt")
+    if a.abundance and not os.path.isfile(D["abundance_path"]):
+        mf4.stop(f"--abundance {a.abundance}: not found")
+    ab_lines = []
+    D["abundance"] = {(s_, g_): v_ for s_, g_, v_ in mf4.read_abundance(
+        D["abundance_path"], list(D["samples"]), sorted({i["MGS"] for i in D["mags"].values() if i["MGS"]}),
+        ab_lines.append)}
+    for line in ab_lines:
+        log(line)
+    if not os.path.isfile(D["abundance_path"]):
+        D["abundance_path"] = ""
     samples, bams, mags = D["samples"], D["bams"], D["mags"]
-    try:
-        overrides = motabundance.coverage_overrides(a.coverage_map, samples)
-    except (OSError, ValueError) as e:
-        mf4.stop(str(e))
     unresolved = []                                              # (sample, MAG, BAM, reason)
 
     # ---- genomes, one job per assembly
@@ -678,24 +675,6 @@ def main():
     st = collections.Counter(i["status"] for i in mags.values())
     log("MAGs: " + "  ".join(f"{k} {v}" for k, v in sorted(st.items()))
         + f" ; {genecat_checked} checked base by base against GeneCat's FASTA")
-
-    # ---- independent sample-specific coverage: all assembly contigs contribute to the denominator
-    abundance_jobs = []
-    for s, v in samples.items():
-        ms = {m: i["contigs"] for m, i in mags.items() if i["asm"] == v["asm"] and i["contigs"]}
-        if not ms:
-            continue
-        abundance_jobs.append(dict(sample=s, source=motabundance.find_coverage(D["run"], s, overrides),
-                                   fasta=asm_fasta(v["asm"]), mags=ms,
-                                   cache=os.path.join(lib, ".work", safe(s) + ".abundance.json")))
-    abundance = {}
-    with cf.ProcessPoolExecutor(max(1, min(a.threads, len(abundance_jobs) or 1))) as ex:
-        for result in ex.map(motabundance.quantify, abundance_jobs):
-            abundance[result["sample"]] = result
-            if result["status"] not in ("ok", "zero_sample_depth"):
-                unresolved.append((result["sample"], "", "", "abundance: " + result["reason"]))
-    log(f"abundance: {sum(v['status'] == 'ok' for v in abundance.values())}/{len(abundance_jobs)} sample depth "
-        "tracks validated (normalization includes unbinned assembly contigs)")
 
     # ---- samples, one job per CRAM
     ready_bam = {p: b["mot_ready"] for p, b in bams.items()}
@@ -757,13 +736,14 @@ def main():
                 log(f"  {j['sample']}: FAILED {e}")
     for s, v in samples.items():
         v.setdefault("status", "ok")
-    finish(a, D, lib, table, sjobs, stats, contig_rows, unresolved, t_start, abundance)
+    finish(a, D, lib, table, sjobs, stats, contig_rows, unresolved, t_start)
 
 
-def finish(a, D, lib, table, sjobs, stats, contig_rows, unresolved, t_start, abundance):
+def finish(a, D, lib, table, sjobs, stats, contig_rows, unresolved, t_start):
     samples, bams, mags = D["samples"], D["bams"], D["mags"]
     jobs = {j["sample"]: j for j in sjobs}
     rows, amag = [], []                                         # mot rows ; assignment summary rows
+    ab = D.get("abundance", {})                                 # (SmplID, MGS) -> GeneCat's value (> 0)
     for s, v in samples.items():
         if v["status"] != "ok":
             if v["status"] != "no_final_MAG_in_assembly":           # an assembly without final MAGs: nothing to export
@@ -774,18 +754,21 @@ def finish(a, D, lib, table, sjobs, stats, contig_rows, unresolved, t_start, abu
         sel = collections.defaultdict(dict)
         for m, b, c in st["selections"]:
             sel[m][b] = c
+        # mot fits one adapter per sample (all its genomes, one technical state): one chemistry per sample
+        chems = {kits(bams[os.path.realpath(j["bam_paths"][b])]["chemistry"]) for m in j["mags"] for b in sel.get(m, {})}
         for m in j["mags"]:
             c = st["per_mag"].get(m, {})
             out = sel.get(m, {})
-            mname = mot_name(s, mags[m])
-            chems = {kits(bams[os.path.realpath(j["bam_paths"][b])]["chemistry"]) for b in out}
             why = ("" if mags[m]["status"] == "ok" else f"MAG {mags[m]['status']}") or \
-                  ("several chemistries in one mot sample (mot refuses it)" if len(chems) > 1 else "")
+                  ("several chemistries in one sample (mot fits one adapter per sample; give each chemistry's BAMs "
+                   "a sample of their own)" if len(chems) > 1 else "")
+            mgs = mags[m]["MGS"]
             for b, n in sorted(out.items()):
                 bam = j["bam_paths"][b]
                 reads = os.path.join(lib, "assignments", safe(s), mags[m]["file"], j["bam_label"][b] + ".reads.txt.gz")
-                r = dict(sample=mname, bam=bam, ref=mags[m]["fasta"], role="native", reads=reads, group=s,
-                         _s=s, _m=m, _n=n)
+                r = dict(sample=mot_name(s), genome=mot_name(mags[m]["file"]), bam=bam, reads=reads,
+                         ref=mags[m]["fasta"], mgs=mgs or ".", abundance=ab.get((s, mgs), ".") if mgs else ".",
+                         role="native", _s=s, _m=m, _n=n)
                 if why:
                     unresolved.append((s, m, bam, why))
                 else:
@@ -838,20 +821,28 @@ def finish(a, D, lib, table, sjobs, stats, contig_rows, unresolved, t_start, abu
             unresolved.append((r["_s"], r["_m"], r["bam"], "BAM shared with another sample and the same molecules "
                                                            "selected for both (MATAFILER4 mapped them twice)"))
     rows = [r for r in rows if id(r) not in drop]
-    rows.sort(key=lambda r: (r["sample"], r["bam"]))
+    rows.sort(key=lambda r: (r["sample"], r["genome"], r["bam"]))
 
     # ---- validation of what is written
     checks = []
     def check(name, ok, detail=""):
         checks.append(dict(check=name, ok=bool(ok), detail=detail))
-    names = collections.Counter((r["sample"], r["bam"]) for r in rows)
-    check("mot sample names valid (mot rule: letters, digits . _ -, <= 100)", all(MOT_NAME.match(r["sample"]) for r in rows),
-          ", ".join(r["sample"] for r in rows if not MOT_NAME.match(r["sample"]))[:300])
-    check("one row per mot sample x BAM", all(k == 1 for k in names.values()))
-    refs = collections.defaultdict(set)
+    names = collections.Counter((r["sample"], r["genome"], r["bam"]) for r in rows)
+    bad = [x for r in rows for x in (r["sample"], r["genome"]) if not MOT_NAME.match(x)]
+    check("mot sample and genome names valid (mot rule: letters, digits . _ -, <= 100)", not bad, ", ".join(bad)[:300])
+    check("one row per sample x genome x BAM", all(k == 1 for k in names.values()))
+    refs, srcs, gsrc, chem_of = (collections.defaultdict(set) for _ in range(4))
     for r in rows:
-        refs[r["sample"]].add(r["ref"])
-    check("one reference per mot sample", all(len(v) == 1 for v in refs.values()))
+        refs[(r["sample"], r["genome"])].add((r["ref"], r["mgs"], r["abundance"]))
+        srcs[r["sample"]].add(r["_s"])
+        gsrc[r["genome"]].add(r["_m"])
+        chem_of[r["sample"]].add(kits(bams[os.path.realpath(r["bam"])]["chemistry"]))
+    check("one reference, mgs and abundance per sample x genome", all(len(v) == 1 for v in refs.values()))
+    check("one MATAFILER4 sample per mot sample name, one MAG per genome name",
+          all(len(v) == 1 for v in srcs.values()) and all(len(v) == 1 for v in gsrc.values()))
+    check("one chemistry per mot sample (mot's rule)", all(len(v) == 1 for v in chem_of.values()))
+    check("abundance a number >= 0 or '.'", all(r["abundance"] == "." or num(r["abundance"]) >= 0 for r in rows),
+          ", ".join(sorted({r["abundance"] for r in rows if r["abundance"] != "." and not num(r["abundance"]) >= 0}))[:300])
     # every selection file, one BAM at a time (memory: one BAM's molecules)
     bad_files, bad_sel, overlap = [], [], []
     rows_of = collections.defaultdict(list)
@@ -899,51 +890,8 @@ def finish(a, D, lib, table, sjobs, stats, contig_rows, unresolved, t_start, abu
     check("at least one MAG exported", ok_mags > 0)
     check("at least one mot row", bool(rows))
 
-    # The public table is the complete MAG x sample matrix. Per-BAM selections remain
-    # separate internally so attribution, duplicate-molecule and chemistry checks still apply.
-    pair_rows = collections.defaultdict(list)
-    for r in rows:
-        pair_rows[(r["_s"], r["_m"])].append(r)
-    seen_names, collision = {}, []
-    for s, m in pair_rows:
-        n = mot_name(s, mags[m])
-        if n in seen_names and seen_names[n] != (s, m):
-            collision.append(n)
-        seen_names[n] = (s, m)
-    check("one distinct valid MOT sample name per callable MAG x sample pair",
-          not collision and all(MOT_NAME.match(n) for n in seen_names), ", ".join(collision[:5]))
-
-    def public_rows():
-        for s, v in samples.items():
-            for m, i in mags.items():
-                selected = pair_rows.get((s, m), [])
-                ev = abundance.get(s)
-                metrics = motabundance.pair_metrics(v, i, ev)
-                # If the CRAM itself disagrees with the exported reference, the corresponding
-                # coverage track is not accepted as evidence for that MAG either.
-                if metrics["abundance_status"] == "ok" and stats.get(s, {}).get("mag_contigs_mismatch"):
-                    metrics = dict.fromkeys(motabundance.METRICS)
-                    metrics.update(abundance_status="reference_mismatch",
-                                   abundance_reason="sample CRAM reference differs from exported MAG reference")
-                profiled = bool(v["asm"] and i["asm"] and os.path.realpath(v["asm"]) == os.path.realpath(i["asm"]))
-                mot_status = ("ready" if selected else "not_profiled" if not profiled else
-                              "sample_unavailable" if v["status"] != "ok" else
-                              "MAG_unavailable" if i["status"] != "ok" else "no_selected_molecules")
-                why = "" if selected else (v["status"] if v["status"] != "ok" else mot_status)
-                source = ev.get("source", {}) if ev and profiled else {}
-                yield ([mot_name(s, i), json.dumps([r["bam"] for r in selected], separators=(",", ":")), i["fasta"],
-                        "native", json.dumps([r["reads"] for r in selected], separators=(",", ":")), s,
-                        m, i["MGS"] or "?", D["binner"], metrics["normalized_abundance"], motabundance.UNIT,
-                        metrics["abundance_status"], metrics["abundance_reason"]]
-                       + [metrics[k] for k in motabundance.METRICS if k != "normalized_abundance"]
-                       + [source.get("path", ""), source.get("format", ""), mot_status, why])
-
     # ---- write the table, catalog, qc, manifest
-    table_columns = (["sample", "bam", "ref", "role", "reads", "group", "MAG", "MGS", "binner",
-                      "normalized_abundance", "abundance_unit", "abundance_status", "abundance_reason"]
-                     + [k for k in motabundance.METRICS if k != "normalized_abundance"]
-                     + ["coverage_source", "coverage_format", "mot_status", "mot_reason"])
-    tsv(table, table_columns, public_rows())
+    tsv(table, MOT_COLUMNS, [tuple(r[k] for k in MOT_COLUMNS) for r in rows])
     cat = os.path.join(lib, "catalog")
     tsv(os.path.join(cat, "mags.tsv"),
         ["MAG", "file", "MGS", "is_MGS_rep", "status", "sample", "assembly", "n_contigs", "bp", "n_circular",
@@ -1020,12 +968,13 @@ def finish(a, D, lib, table, sjobs, stats, contig_rows, unresolved, t_start, abu
         ("reference mismatch", T["molecules_reference_mismatch"]), ("no primary", T["molecules_no_primary"]),
         ("unresolved BAM (movie)", T["bam_unresolved"]),
         ("selected for mot", T["molecules_selected"]), ("  of which QC-failed / duplicate", f"{T['selected_qc_fail']} / {T['selected_duplicate']}"),
-        ("sample/MAG/BAM combinations", combos), ("table rows (MAG x sample)", len(mags) * len(samples)),
-        ("selected sample/MAG/BAM inputs", len(rows)),
-        ("mot samples (sample x MAG)", len({r["sample"] for r in rows})),
+        ("sample/MAG/BAM combinations", combos), ("mot rows", len(rows)),
+        ("mot samples", len({r["sample"] for r in rows})),
+        ("mot units (sample x genome)", len({(r["sample"], r["genome"]) for r in rows})),
+        ("  with an MGS / with GeneCat abundance", f"{len({(r['sample'], r['genome']) for r in rows if r['mgs'] != '.'})} / "
+                                                   f"{len({(r['sample'], r['genome']) for r in rows if r['abundance'] != '.'})}"),
+        ("GeneCat abundance table", D.get("abundance_path") or "none"),
         ("min MAPQ", a.min_mapq), ("QC-failed molecules selected", "no" if a.exclude_qcfail else "yes"),
-        ("abundance unit", motabundance.UNIT),
-        ("samples with validated nonzero depth", sum(e["status"] == "ok" for e in abundance.values())),
         ("CRAMs without retained-alignment evidence", len(no_ret)),
         ("unresolved items", len(set(unresolved))), ("status", status),
     ]
@@ -1036,23 +985,13 @@ def finish(a, D, lib, table, sjobs, stats, contig_rows, unresolved, t_start, abu
         tool="mmt export-mot", mmt_version=a.version, method=METHOD, created=datetime.datetime.now().isoformat(timespec="seconds"),
         table=table, library=lib, status=status,
         inputs=dict(mf4_run=D["run"], genecat=D["gc"], binner=D["binner"], maps=D["maps"], maps_from=D["map_src"],
-                    magvsgc=mag_table(D["gc"], D["binner"]),
-                    magvsgc_stamp=stamp(mag_table(D["gc"], D["binner"]))),
+                    magvsgc=os.path.join(D["gc"], f"Bin_{D['binner']}", "MAGvsGC.txt.gz"),
+                    magvsgc_stamp=stamp(os.path.join(D["gc"], f"Bin_{D['binner']}", "MAGvsGC.txt.gz")),
+                    abundance=D.get("abundance_path", ""), abundance_stamp=stamp(D.get("abundance_path", ""))),
+        table_format=dict(columns=MOT_COLUMNS, mot="0.7 input table (mot help input)",
+                          abundance="GeneCat's MGS abundance of the MAG's MGS in the sample; '.' = no MGS, or no value "
+                                    "> 0 for the pair in GeneCat's table"),
         settings=dict(min_mapq=a.min_mapq, exclude_qcfail=a.exclude_qcfail, threads=a.threads),
-        table_schema=dict(version=2, columns=table_columns, row_key=["group", "MAG"],
-                          scope="every discovered final MAG x sample; unprofiled pairs are NA, not zero",
-                          bam_reads_encoding="paired JSON arrays, including for one BAM; [] when not ready",
-                          caller_rows="mot_status == ready; expand paired bam/reads arrays internally",
-                          compatibility="requires a MOT reader supporting schema 2; older MOT rejects this table"),
-        abundance=dict(method=motabundance.METHOD, unit=motabundance.UNIT,
-                       formula="MAG mean depth * 1e9 / sample-wide depth integral",
-                       denominator="sum(interval_length * depth) over ALL contigs of this sample's assembly, "
-                                   "including unbinned/lower-quality bins; not all sequenced or microbial bases",
-                       coverage_filters="inherited from MF4 depth; independent of MOT molecule selection/MAPQ",
-                       percontig_fallback="length-weighted contig means; rounding inherited; breadth/SD unavailable",
-                       calibration="relative to assembly-mapped sequencing effort; not absolute biological copies",
-                       coverage_map=os.path.abspath(a.coverage_map) if a.coverage_map else "",
-                       samples={s: {k: v for k, v in e.items() if k != "mags"} for s, e in abundance.items()}),
         assignment=dict(scope="competitive within the (co-)assembly each sample's reads were mapped to by MATAFILER4 "
                               "(<run>/<S>/mapping/<S>-smd.cram); not across the cohort",
                         statuses={k: v for k, v in STATUS_DOC.items()}, selected=SELECTED_DOC),

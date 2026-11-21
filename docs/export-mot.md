@@ -1,16 +1,12 @@
 # mmt export-mot
 
-A finished MATAFILER4 run and its GeneCat MGS stage become **one table with exactly one row per final MAG x sample**,
-including MGS identity, normalized abundance, coverage evidence and paired raw-BAM/read-selection lists. One FASTA
-per final MAG and the molecule selections remain in the accompanying library. Nothing in the MF4 run is changed;
-no BAM or CRAM is copied.
-
-**Schema 2 (MMT 0.9.0) requires an updated MOT reader.** Older MOT rejects the new columns and JSON lists. There is
-one exported input/abundance table, rather than a separate metadata table.
+A finished MATAFILER4 run and its GeneCat MGS stage become one input table for Methyl-o-Type (`mot`): one FASTA per
+final MAG, and per sample x MAG x raw BAM the PacBio molecules MATAFILER4 aligned to that MAG. Nothing in the run is
+changed; no BAM or CRAM is copied.
 
 ```bash
-mmt export-mot -i /path/METH_PearlAge -gc /path/GC_METH_PearlAge -o /path/MOT/mot_input.tsv --binner SB -t 8
-# Feed this table to MOT after its reader supports schema 2 (contract below).
+mmt export-mot -i /path/METH_PearlAge -gc /path/GC_METH_PearlAge -o /path/MOT/mot_input.tsv -t 8
+mot call -i /path/MOT/mot_input.tsv -b sprq.motbin -o /path/MOT/calls --check    # mot (0.7+) validates it
 ```
 
 Run it as a job (one node, `-t` = CRAMs read at once; memory about 0.5 GB per million CRAM records per CRAM read at
@@ -24,83 +20,34 @@ once, e.g. `-t 8 --mem 32G`). A rerun redoes only samples / assemblies whose inp
 | maps | `--map`, else the maps GeneCat was run with (`<GC>/LOGandSUB/GCmaps.ori`), else GeneCat's copies (`LOGandSUB/inmap.txt` -> `map.N.txt`) | samples, co-assembly groups (aliases), BAM search rule |
 | samples | map rows with a folder `<run>/<SmplID>` | the run's samples (rows of other runs in a combined GeneCat are skipped) |
 | assembly | first line of `<run>/<S>/assemblies/metag/assembly.txt` | shared by every member of a co-assembly group |
-| final MAGs | every non-canopy row of `<GC>/Bin_<binner>/MAGvsGC.txt.gz` (or `.txt`; MGS `?` included) | MAG and MGS found by header name; conflicting identities fail |
-| MAG contigs | `<assembly>/Binning/<binner>/<SmplID>` (or `.gz`; MAG `<sample or alias>__<bin>`, alias `<SmplID>M<n>` -> SmplID) | GeneCat's own rules (`lib/mf4.py bin_contigs`, shared with the MMT index) |
+| final MAGs | every non-canopy row of `<GC>/Bin_<binner>/MAGvsGC.txt.gz` (MGS `?` included) | the bins that passed GeneCat's quality filter; lower bins are not MAGs |
+| MAG contigs | `<assembly>/Binning/<binner>/<SmplID>` (MAG `<sample or alias>__<bin>`, alias `<SmplID>M<n>` -> SmplID) | GeneCat's own rules (`lib/mf4.py bin_contigs`, shared with the MMT index) |
 | sequence | `<assembly>/scaffolds.fasta.filt(.gz)` | the binning input and MATAFILER4's mapping reference |
 | circular | contigs listed in `<assembly>/scaffolds.fasta.circ` | MATAFILER4's record; sequences are never re-circularised or trimmed |
 | check | `<GC>/Bin_<binner>/Genomes/MGS_ctg/<MGS>.ctgs.<MAG>` where it exists (representatives) | contig set and every base must equal |
 | raw BAMs | `<run>/<S>/input_raw.txt` (the files MATAFILER4 read), else the map (`#DirPath` + `<SmplPrefix>*.bam`) | a sample may have several; a BAM that does not open is not used |
 | reads | `<run>/<S>/mapping/<S>-smd.cram` (+ `.retained.size`, `-smd.reference.stat`) | the sample's reads aligned to its own (co-)assembly |
-| abundance | sample `mapping/<S>-smd.bam.coverage(.gz)`, then `-smd.cram.coverage(.gz)`; fallback sample `assemblies/metag/ContigStats/Coverage.percontig(.gz)` | never co-assembly pooled depth or MGS abundance |
+| abundance | `--abundance`, else `<GC>/Bin_<binner>/Annotation/Abundance/MGS.matL0.txt` (MGS x samples, or the transpose) | the table's `abundance` column: GeneCat's MGS abundance in the sample |
 
-The binner is automatic only when exactly one `Bin_*` contains a MAGvsGC table. With several, **`--binner TAG` is
-required**: a configured SB default cannot silently select the wrong result. Every MAG identity and bin membership
-uses that binner. Assembly paths are canonicalized; relative pointers resolve against `assembly.txt`.
-
-Relocated or future MF4 coverage layouts can be supplied with `--coverage-map FILE`: a TSV with `sample` and
-`coverage` columns, optionally `format` (`bedgraph` or `percontig`; otherwise detected). Paths are relative to the TSV,
-or absolute. Unknown/repeated sample IDs and missing paths fail before processing. Overrides are authoritative;
-an invalid override is not silently replaced. Discovery stays within the named sample, never recursively choosing
-another sample's coverage or a support/co-assembly track.
+The binner is the only `Bin_*` with a MAGvsGC table (several: `--binner`, else `MMT_BINNER` if it is one of them).
 
 ## Outputs
 
-`OUT.tsv` has row key **`group` + `MAG`**. It contains every discovered final MAG x run sample combination, including
-those with no selected molecules. `sample` = `<SmplID>__<MAG>` (MAG without `.fa.gz`; characters outside
-`A-Za-z0-9._-` -> `_`; over 100 characters: cut + checksum). `group` = original SmplID; `role` = native.
+`OUT.tsv` - mot 0.7's input table (`mot help input`): `sample genome bam reads ref mgs abundance role`, one row per
+sample x MAG x raw BAM that has selected molecules. mot writes `OUT/<sample>/<genome>/`.
 
-| Columns | Meaning |
+| Column | Value |
 |---|---|
-| `sample`, `group`, `MAG`, `MGS`, `binner` | Calling ID, original sample, exact MAG, GeneCat MGS (`?` if none), selected binner |
-| `bam`, `reads` | **JSON arrays in every row**, including singleton arrays; index `i` pairs BAM `i` with selection file `i`. Empty arrays `[]` when no inputs are callable. |
-| `ref`, `role` | Exported MAG FASTA (empty if unavailable), `native` |
-| `mot_status`, `mot_reason` | `ready` rows have validated BAM/selection pairs; otherwise `not_profiled`, `sample_unavailable`, `MAG_unavailable`, or `no_selected_molecules` |
-| `normalized_abundance`, `abundance_unit` | Mean MAG depth per Gbp contributing to this sample's assembly depth; unit `fold_coverage_per_Gbp_assembly_mapped` |
-| `abundance_status`, `abundance_reason` | `ok`, `not_profiled`, `unavailable`, `invalid_coverage`, `reference_unavailable`, `reference_mismatch`, `MAG_unavailable`, `shared_contigs`, or `zero_sample_depth` |
-| `mag_mean_depth`, `mag_breadth_1x`, `mag_depth_sd` | Length-weighted mean depth, fraction of MAG bases at depth >=1, base-level depth SD; zero-depth positions included |
-| `mag_mapped_bases`, `sample_mapped_bases` | Sum of interval length x depth within MAG and across the full sample assembly |
-| `mag_reference_bp`, `sample_reference_bp` | MAG length and full assembly length |
-| `mapped_base_fraction` | MAG depth integral / sample depth integral: a mapped DNA-base fraction, not a cell fraction |
-| `coverage_source`, `coverage_format` | Exact evidence file and `bedgraph`/`percontig` format |
+| `sample` | the SmplID: every MAG of a sample shares one mot sample (mot fits one adapter per sample, on all its genomes) |
+| `genome` | the MAG (its file name, without `.fa.gz`); the rows of one sample x MAG from several BAMs are one mot unit |
+| `bam` | the raw HiFi BAM with kinetics |
+| `reads` | that BAM's molecules of that MAG (`assignments/...reads.txt.gz`); never empty |
+| `ref` | the MAG FASTA (`genomes/<MAG>.fa.gz`) |
+| `mgs` | the MAG's MGS (GeneCat); `.` for a MAG without one (MGS `?`) |
+| `abundance` | GeneCat's abundance of that MGS in that sample (`MGS.matL0.txt`, as written there); `.` without an MGS, or where the table has no value above 0 for the pair (or no table) |
+| `role` | `native` |
 
-Unavailable numeric values are **`NA`, never zero**. An observed MAG with zero depth and a nonzero sample denominator
-has numeric zero. A sample mapped only against its own assembly has **no estimate for another assembly's MAG**:
-these pairs are `not_profiled`, even when another MAG belongs to the same MGS. MGS abundance is never copied to
-individual member MAGs.
-
-### Abundance definition
-
-```text
-sample_mapped_bases    = sum(interval_length * depth) across ALL assembly contigs
-mag_mapped_bases       = the same sum restricted to this MAG
-mag_mean_depth         = mag_mapped_bases / mag_reference_bp
-normalized_abundance  = mag_mean_depth * 1e9 / sample_mapped_bases
-```
-
-Unbinned contigs and lower-quality bins contribute to the denominator. Fragmented MAGs are length-weighted.
-Coverage inherits MF4's existing depth filters, independently of export's `--min-mapq`, `--exclude-qcfail`, BAM
-byte sizes, BAM count and selected-molecule counts. Support-library coverage is not mixed into primary coverage.
-
-This is **coverage per Gbp of assembly-mapped sequencing effort**, not per Gbp of all sequenced DNA, a genome
-percentage, or physical copies per gram. Unmapped/unassembled sequence is excluded. Assembly recovery and mapping
-ambiguity can affect comparisons; existing own-assembly mappings are not cohort-wide competitive quantification.
-
-Full zero-inclusive bedGraph is validated against every assembly contig and length. Gaps, overlaps, unknown
-contigs, truncated references, non-finite/negative depths and incomplete tracks yield `NA` and PARTIAL. Contig-mean
-fallback requires every assembly contig too; rounding is inherited and breadth/SD remain `NA`. Shared MAG contigs
-are not used as independent abundance evidence. Abundance caches include source path/size/nanosecond mtime,
-assembly identity, method and MAG membership; changed coverage refreshes abundance without redoing unchanged
-molecule assignments.
-
-### Contract for the MOT reader update
-
-1. Read columns by name. Preserve `group` + `MAG` as row key and `MGS` as metadata.
-2. Call only `mot_status=ready` rows. Decode `bam` and `reads` as equal-length, nonempty JSON arrays. Process each
-   matched pair under the row's single `sample` and `ref`, combining BAM evidence within that sample.
-3. Preserve abundance metadata. `abundance_status=ok` identifies usable estimates; `NA`/unprofiled is not absence.
-   Molecule inputs can be callable even when abundance is unavailable.
-4. Abundance describes the MAG x sample once; do not sum it once per BAM. It is not a methylation probability
-   or a reason to alter the kinetic null.
+Names follow mot's rule (characters outside `A-Za-z0-9._-` -> `_`; over 100 characters: cut + checksum).
 
 `OUT.motlib/`
 
@@ -124,7 +71,7 @@ secondary_MAGs.
 
 MATAFILER4 aligns each sample's reads to its own (co-)assembly. So the CRAM is a competitive mapping **within that
 assembly** (every contig of it, binned or not): a molecule's best place among those contigs. It is **not** a cohort-wide
-competitive mapping: a sample's CRAM never saw the MAGs of other assemblies, and callable inputs exist only where the CRAM
+competitive mapping: a sample's CRAM never saw the MAGs of other assemblies, and mot rows are made only where the CRAM
 has evidence (a sample x MAG of its own assembly). Co-assembled samples each have their own CRAM against the shared
 assembly: each becomes its own mot sample on the shared MAG FASTA.
 
@@ -160,13 +107,14 @@ never exported. A BAM is mot-ready when it opens, carries kinetics (`fi`/`ri`/`i
 - **PARTIAL**: the table holds every row that validated; `qc/unresolved.tsv` lists what was left out and why: a sample
   with PacBio reads but no raw BAM, a BAM without kinetics, a CRAM made against another version of a contig, a MAG
   that could not be exported (contigs missing, sequence differs from GeneCat), molecules whose BAM cannot be named,
-  several chemistries in one mot sample, one BAM in two samples with the same molecules. Samples without PacBio data
+  several chemistries in one sample (mot needs one per sample), one BAM in two samples with the same molecules. Samples without PacBio data
   (Illumina, ONT) and assemblies without a final MAG are not problems; they are listed in `catalog/samples.tsv`.
 - **FAILED**: a check of the written files failed, or nothing can be exported (no GeneCat table, MMT's naming rules
   disagree with GeneCat's own FASTA, ...).
 
-Checks before COMPLETE / PARTIAL (`qc/validation.json`): mot sample names valid; one selection per calling sample x BAM; one
-reference per mot sample; every bam / ref / .fai / reads file exists; every selection non-empty, unique, `movie/zmw`,
+Checks before COMPLETE / PARTIAL (`qc/validation.json`): mot sample and genome names valid; one row per sample x
+genome x BAM; one reference, mgs and abundance per sample x genome; one SmplID per sample name and one MAG per genome
+name; one chemistry per sample; abundance a number or `.`; every bam / ref / .fai / reads file exists; every selection non-empty, unique, `movie/zmw`,
 its movies in its BAM, its count = the catalog's; selected molecules in the catalog = lines in the selection files; no
 molecule in two rows of one BAM; every molecule has one status. The MAG FASTAs were checked base by base against
 GeneCat's where GeneCat has one.
@@ -178,6 +126,6 @@ GeneCat's where GeneCat has one.
 - The source BAM of a molecule is named by its movie, not by scanning the BAM for every ZMW; mot reports how many
   listed molecules it found.
 - A polished contig of the same length is caught only through the CRAM's M5 (CRAM headers normally carry it).
-- The schema-2 table adds MAG / MGS / abundance columns and JSON BAM/read arrays. MOT must support this contract
-  before using the table. MMT does not modify MOT itself.
-- The full MAG x sample Cartesian table can be large. Unprofiled pairs are explicit `NA` rows, not extra mappings.
+- `abundance` is GeneCat's per-MGS value, not a per-MAG measurement: two MAGs of one MGS in a sample carry the same
+  value. The per-MAG molecule counts are in `qc/assignment_summary.tsv`.
+- The table is mot 0.7's (`sample` + `genome`); mot 0.6 does not read it. For mot 0.6, export with MMT 0.8.0.
